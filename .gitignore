@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local virtual environment
+venv/
+.venv/
+
+# Generated CAD files
+output*.dxf
+
+# Local source images can be large or project-specific.
+# Commit sample images intentionally if needed.
+map.png
+
+# User-specific scale calibration
+scale.json
