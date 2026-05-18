@@ -47,6 +47,15 @@ from src.config_store import (
     normalize_image_path,
     save_config as save_config_file,
 )
+from src.project_store import (
+    build_project_data as build_project_file_data,
+    deserialize_lines as deserialize_project_lines,
+    deserialize_points as deserialize_project_points,
+    get_existing_project_created_at,
+    get_project_background_warning,
+    load_project as load_project_file,
+    save_project as save_project_file,
+)
 from src.scale_utils import (
     image_fits_paper_at_scale as calc_image_fits_paper_at_scale,
     nearest_standard_scale,
@@ -566,142 +575,27 @@ class SimpleCadApp:
 
         print(f"縮尺設定を保存しました: {SCALE_FILE}")
 
-    def serialize_points(self, points):
-        """JSON保存用に点列を [x, y] の配列へそろえます。"""
-
-        return [[float(x), float(y)] for x, y in points]
-
-    def deserialize_points(self, points):
-        """project.json の点列をアプリ内部の (x, y) へ戻します。"""
-
-        restored_points = []
-
-        if not isinstance(points, list):
-            return restored_points
-
-        for point in points:
-            if not isinstance(point, (list, tuple)) or len(point) != 2:
-                continue
-
-            x, y = point
-            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                continue
-
-            restored_points.append((float(x), float(y)))
-
-        return restored_points
-
-    def serialize_lines(self):
-        """確定済み図形を project.json 用のデータへ変換します。"""
-
-        serialized_lines = []
-
-        for line in self.lines:
-            layer = line.get("layer", {})
-            layer_name = layer.get("name")
-            layer_key = self.get_layer_key_by_name(layer_name)
-
-            serialized_lines.append(
-                {
-                    "layer_key": layer_key,
-                    "layer": layer,
-                    "points": self.serialize_points(line.get("points", [])),
-                    "closed": bool(line.get("closed", False)),
-                }
-            )
-
-        return serialized_lines
-
-    def deserialize_lines(self, lines):
-        """project.json の図形データをアプリ内部形式へ戻します。"""
-
-        restored_lines = []
-
-        if not isinstance(lines, list):
-            return restored_lines
-
-        for line in lines:
-            if not isinstance(line, dict):
-                continue
-
-            points = self.deserialize_points(line.get("points", []))
-            if len(points) < 2:
-                continue
-
-            layer_key = line.get("layer_key")
-            layer = None
-
-            if isinstance(layer_key, str) and layer_key in LAYERS:
-                layer = LAYERS[layer_key].copy()
-            elif isinstance(line.get("layer"), dict):
-                layer = line["layer"].copy()
-
-            if layer is None:
-                layer = self.current_layer().copy()
-
-            restored_lines.append(
-                {
-                    "layer": layer,
-                    "points": points,
-                    "closed": bool(line.get("closed", False)),
-                }
-            )
-
-        return restored_lines
-
-    def get_layer_key_by_name(self, layer_name):
-        """DXFレイヤ名からアプリのレイヤキーを探します。"""
-
-        for key, layer in LAYERS.items():
-            if layer.get("name") == layer_name:
-                return key
-
-        return self.current_layer_key
-
-    def get_existing_project_created_at(self):
-        """既存project.jsonの作成日時があれば引き継ぎます。"""
-
-        if not os.path.exists(PROJECT_FILE):
-            return None
-
-        try:
-            with open(PROJECT_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError):
-            return None
-
-        created_at = data.get("created_at")
-        if isinstance(created_at, str) and created_at:
-            return created_at
-
-        return None
-
     def build_project_data(self):
         """現在の作業状態を project.json 用の辞書へまとめます。"""
 
-        now = datetime.now().isoformat(timespec="seconds")
-
-        return {
-            "background_image": self.get_storable_image_path(self.background_image_path),
-            "meters_per_pixel": self.meters_per_pixel,
-            "current_layer": self.current_layer_key,
-            "lines": self.serialize_lines(),
-            "current_points": self.serialize_points(self.current_points),
-            "layers": LAYERS,
-            "created_at": self.get_existing_project_created_at() or now,
-            "updated_at": now,
-        }
+        return build_project_file_data(
+            background_image=self.background_image_path,
+            meters_per_pixel=self.meters_per_pixel,
+            current_layer=self.current_layer_key,
+            lines=self.lines,
+            current_points=self.current_points,
+            layers=LAYERS,
+            created_at=get_existing_project_created_at(PROJECT_FILE),
+        )
 
     def save_project(self):
         """作業途中の状態を project.json に保存します。"""
 
         data = self.build_project_data()
 
-        try:
-            with open(PROJECT_FILE, "w", encoding="utf-8") as file:
-                json.dump(data, file, ensure_ascii=False, indent=2)
-        except OSError as error:
-            print(f"{PROJECT_FILE} を保存できませんでした: {error}")
+        success, error_message = save_project_file(PROJECT_FILE, data)
+        if not success:
+            print(error_message)
             self.show_temporary_notice("作業を保存できませんでした")
             return
 
@@ -711,23 +605,18 @@ class SimpleCadApp:
     def load_project(self, auto=False, show_notice=True, redraw=True):
         """project.json から作業途中の状態を読み込みます。"""
 
-        if not os.path.exists(PROJECT_FILE):
+        data, error_message = load_project_file(PROJECT_FILE)
+        if error_message:
             if not auto:
-                print(f"{PROJECT_FILE} がありません")
+                print(error_message)
                 if show_notice:
-                    self.show_temporary_notice("project.json がありません")
+                    if "ありません" in error_message:
+                        self.show_temporary_notice("project.json がありません")
+                    else:
+                        self.show_temporary_notice("作業を読み込めませんでした")
             return False
 
-        try:
-            with open(PROJECT_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError) as error:
-            print(f"{PROJECT_FILE} を読み込めませんでした: {error}")
-            if show_notice:
-                self.show_temporary_notice("作業を読み込めませんでした")
-            return False
-
-        warning_message = self.get_project_background_warning(data)
+        warning_message = get_project_background_warning(data, self.background_image_path)
         if warning_message:
             print(warning_message)
 
@@ -739,8 +628,12 @@ class SimpleCadApp:
         if isinstance(current_layer, str) and current_layer in LAYERS:
             self.current_layer_key = current_layer
 
-        self.lines = self.deserialize_lines(data.get("lines", []))
-        self.current_points = self.deserialize_points(data.get("current_points", []))
+        self.lines = deserialize_project_lines(
+            data.get("lines", []),
+            layers=LAYERS,
+            default_layer_key=self.current_layer_key,
+        )
+        self.current_points = deserialize_project_points(data.get("current_points", []))
         self.selected_point = None
         self.scale_mode = False
         self.scale_points = []
@@ -762,25 +655,6 @@ class SimpleCadApp:
             self.update_layer_ui()
 
         return True
-
-    def get_project_background_warning(self, data):
-        """project.json と現在設定の背景画像が違う場合の警告文を返します。"""
-
-        project_background = data.get("background_image")
-        if not isinstance(project_background, str) or not project_background.strip():
-            return None
-
-        project_path = self.normalize_image_path(project_background)
-        current_path = self.normalize_image_path(self.background_image_path)
-
-        if project_path == current_path:
-            return None
-
-        return (
-            "警告: project.json の背景画像が現在の背景画像と違います: "
-            f"{self.get_image_identity(project_path)} -> "
-            f"{self.get_image_identity(current_path)}"
-        )
 
     def get_toolbar_mode(self):
         """matplotlibツールバーの現在モードを文字列で返します。"""
