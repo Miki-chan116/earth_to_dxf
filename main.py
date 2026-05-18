@@ -17,7 +17,6 @@ from src.constants import (
     A3_FOCUS_SCALE,
     BACKGROUND_LAYER,
     CIVIL_STANDARD_SCALES,
-    CONFIG_FILE,
     CONFIRMED_LINE_WIDTH,
     CONFIRMED_MARKER_SIZE,
     CROSSHAIR_CENTER_SIZE,
@@ -41,6 +40,12 @@ from src.constants import (
     SCALE_LINE_WIDTH,
     SCALE_MARKER_SIZE,
     SELECTED_MARKER_SIZE,
+)
+from src.config_store import (
+    get_background_image_path,
+    get_storable_image_path,
+    normalize_image_path,
+    save_config as save_config_file,
 )
 from src.scale_utils import (
     image_fits_paper_at_scale as calc_image_fits_paper_at_scale,
@@ -459,10 +464,7 @@ class SimpleCadApp:
     def normalize_image_path(self, image_path):
         """config.json の画像パスをアプリ起点の絶対パスへそろえます。"""
 
-        if os.path.isabs(image_path):
-            return os.path.normpath(image_path)
-
-        return os.path.abspath(image_path)
+        return normalize_image_path(image_path)
 
     def get_image_identity(self, image_path):
         """縮尺の使い回し判定に使う画像名を返します。"""
@@ -472,18 +474,7 @@ class SimpleCadApp:
     def get_storable_image_path(self, image_path):
         """プロジェクト内の画像は config.json へ相対パスで保存します。"""
 
-        absolute_path = self.normalize_image_path(image_path)
-        cwd = os.path.abspath(os.getcwd())
-
-        try:
-            common_path = os.path.commonpath([cwd, absolute_path])
-        except ValueError:
-            return absolute_path
-
-        if common_path == cwd:
-            return os.path.relpath(absolute_path, cwd)
-
-        return absolute_path
+        return get_storable_image_path(image_path)
 
     def load_config(self):
         """背景画像パスを config.json から読み込みます。
@@ -491,51 +482,17 @@ class SimpleCadApp:
         config.json が無い場合は従来どおり map.png を使います。
         """
 
-        default_image_path = self.normalize_image_path(DEFAULT_IMAGE_FILE)
-
-        if not os.path.exists(CONFIG_FILE):
-            return default_image_path
-
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError):
-            print(f"{CONFIG_FILE} を読み込めませんでした。{DEFAULT_IMAGE_FILE} を使います")
-            return default_image_path
-
-        configured_path = data.get("background_image")
-
-        if not isinstance(configured_path, str) or not configured_path.strip():
-            print(f"{CONFIG_FILE} の背景画像パスが不正です。{DEFAULT_IMAGE_FILE} を使います")
-            return default_image_path
-
-        image_path = self.normalize_image_path(configured_path.strip())
-
-        if not os.path.exists(image_path):
-            print(
-                f"背景画像が見つかりません: {image_path}\n"
-                f"{DEFAULT_IMAGE_FILE} を使います"
-            )
-            return default_image_path
-
-        return image_path
+        return get_background_image_path(default=DEFAULT_IMAGE_FILE)
 
     def save_config(self):
         """現在の背景画像パスを config.json に保存します。"""
 
-        data = {
+        config = {
             "background_image": self.get_storable_image_path(self.background_image_path),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-                json.dump(data, file, ensure_ascii=False, indent=2)
-        except OSError as error:
-            print(f"{CONFIG_FILE} を保存できませんでした: {error}")
-            return
-
-        debug_log(f"背景画像設定を保存しました: {CONFIG_FILE}")
+        if save_config_file(config):
+            debug_log("背景画像設定を保存しました: config.json")
 
     def load_scale_settings(self):
         """前回保存した縮尺設定を scale.json から読み込みます。
