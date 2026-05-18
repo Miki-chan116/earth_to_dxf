@@ -9,41 +9,59 @@ import traceback
 import ezdxf
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.backend_bases import cursors
 from matplotlib.widgets import Button, TextBox
 from PIL import Image
+
+from src.constants import (
+    A3_FOCUS_SCALE,
+    BACKGROUND_LAYER,
+    CIVIL_STANDARD_SCALES,
+    CONFIG_FILE,
+    CONFIRMED_LINE_WIDTH,
+    CONFIRMED_MARKER_SIZE,
+    CROSSHAIR_CENTER_SIZE,
+    CROSSHAIR_DOT_SIZE,
+    CROSSHAIR_LINE_WIDTH,
+    CROSSHAIR_MODE,
+    CROSSHAIR_MODES,
+    CROSSHAIR_SMALL_OFFSET_PX,
+    CROSSHAIR_UPDATE_INTERVAL_MS,
+    CURRENT_LINE_WIDTH,
+    CURRENT_MARKER_SIZE,
+    DEBUG,
+    DEFAULT_IMAGE_FILE,
+    LAYERS,
+    MARKER_EDGE_WIDTH,
+    OUTPUT_PREFIX,
+    PRINT_MARGIN_MM,
+    PRINT_PAPER_SIZES_MM,
+    PROJECT_FILE,
+    SCALE_FILE,
+    SCALE_LINE_WIDTH,
+    SCALE_MARKER_SIZE,
+    SELECTED_MARKER_SIZE,
+)
+from src.scale_utils import (
+    image_fits_paper_at_scale as calc_image_fits_paper_at_scale,
+    nearest_standard_scale,
+    next_fitting_standard_scale,
+    print_scale_denominator,
+    printed_image_size_mm,
+    standard_scale_pair,
+)
 
 
 # ============================================================
 # 基本設定
 # ============================================================
 
-IMAGE_FILE = "map.png"
 
-OUTPUT_PREFIX = "output"
+def debug_log(*args, **kwargs):
+    """DEBUG=True のときだけ詳細ログを出します。"""
 
-SCALE_FILE = "scale.json"
-
-PRINT_PAPER_SIZES_MM = {
-    "A4横": (297, 210),
-    "A3横": (420, 297),
-}
-
-PRINT_MARGIN_MM = 10
-
-# ezdxf の AutoCAD Color Index に近い色を matplotlib 用にも用意します。
-# color は DXF 用、plot_color は画面表示用です。
-LAYERS = {
-    "1": {"name": "ROAD", "label": "道路", "color": 1, "plot_color": "#d62728"},
-    "2": {"name": "SITE", "label": "敷地", "color": 3, "plot_color": "#2ca02c"},
-    "3": {"name": "SLOPE", "label": "法面", "color": 5, "plot_color": "#1f77b4"},
-    "4": {"name": "STRUCTURE", "label": "構造物", "color": 2, "plot_color": "#ffbf00"},
-}
-
-BACKGROUND_LAYER = {
-    "name": "IMAGE",
-    "label": "背景画像",
-    "color": 8,
-}
+    if DEBUG:
+        print(*args, **kwargs)
 
 
 def disable_conflicting_matplotlib_shortcuts():
@@ -102,7 +120,9 @@ class SimpleCadApp:
     """
 
     def __init__(self):
-        self.image = Image.open(IMAGE_FILE)
+        self.background_image_path = self.load_config()
+        self.image = Image.open(self.background_image_path)
+        self.save_config()
 
         # 確定済みの線・面です。
         # 例: {"layer": {...}, "points": [(x, y), ...], "closed": False}
@@ -131,11 +151,25 @@ class SimpleCadApp:
         self.scale_submit_cid = None
         self.scale_ok_cid = None
         self.scale_input_error = ""
+        self.scale_needs_reset = False
+        self.scale_reset_message = ""
         self.notice_message = ""
         self.notice_timer = None
         self.notice_expires_at = None
         self.action_message = ""
         self.action_timer = None
+        self.info_detail_expanded = False
+        self.crosshair_mode = (
+            CROSSHAIR_MODE if CROSSHAIR_MODE in CROSSHAIR_MODES else "small"
+        )
+        self.crosshair_enabled = self.crosshair_mode != "off"
+        self.mouse_image_point = None
+        self.crosshair_image_point = None
+        self.crosshair_horizontal = None
+        self.crosshair_vertical = None
+        self.crosshair_center = None
+        self.crosshair_dot = None
+        self.crosshair_last_draw_at = 0.0
         self.load_scale_settings()
 
         # Undo/Redo は現在の作図状態をスナップショット保存する方式にします。
@@ -179,6 +213,8 @@ class SimpleCadApp:
         )
 
         self.layer_title_text = None
+        self.operation_title_text = None
+        self.info_title_text = None
         self.scale_reference_text = None
         self.layer_buttons = {}
         self.ui_axes_set = set()
@@ -187,12 +223,16 @@ class SimpleCadApp:
         self.redo_button = None
         self.close_button = None
         self.scale_button = None
+        self.project_save_button = None
+        self.project_load_button = None
+        self.info_detail_button = None
 
         self.view_initialized = False
 
         self.setup_widgets()
         self.connect_events()
         self.print_help()
+        self.load_project(auto=True, show_notice=False, redraw=False)
         self.redraw(reset_view=True, immediate=True)
 
     # --------------------------------------------------------
@@ -212,15 +252,43 @@ class SimpleCadApp:
             len(line["points"]) for line in self.lines
         )
         selected = "あり" if self.selected_point is not None else "なし"
+        mouse_position = self.get_mouse_position_message()
         return (
             f"MODE: {mode}  |  "
             f"レイヤ: {self.current_layer()['label']}  |  "
             f"縮尺: 1px = {self.meters_per_pixel:.4f}m  |  "
+            f"{mouse_position}  |  "
             f"点数: {total_points}点 "
             f"(作図中 {len(self.current_points)} / 縮尺 {len(self.scale_points)}/2)  |  "
             f"作図中: {len(self.current_points)}点  |  "
-            f"選択: {selected}"
+            f"選択: {selected}  |  "
+            f"十字: {'ON' if self.crosshair_enabled else 'OFF'}({self.crosshair_mode})"
         )
+
+    def get_mouse_position_message(self):
+        """ステータスバー用に現在マウス位置を画像pxとCAD mで返します。"""
+
+        point = self.get_active_drawing_point()
+
+        if point is None:
+            return "クロス中心: -"
+
+        x, y = point
+        cad_x = x * self.meters_per_pixel
+        cad_y = (self.image.height - y) * self.meters_per_pixel
+
+        return (
+            f"クロス中心で作図: x={x:.1f}px y={y:.1f}px / "
+            f"X={cad_x:.2f}m Y={cad_y:.2f}m"
+        )
+
+    def get_active_drawing_point(self):
+        """作図に使う現在位置を返します。"""
+
+        if self.crosshair_enabled and self.crosshair_image_point is not None:
+            return self.crosshair_image_point
+
+        return self.mouse_image_point
 
     def get_mode_code(self):
         """現場で一目で分かる短いモード名を返します。"""
@@ -241,42 +309,233 @@ class SimpleCadApp:
     def get_print_scale_denominator(self, paper_width_mm, paper_height_mm):
         """画像全体を用紙内に収める場合の参考縮尺分母を返します。"""
 
-        printable_width_mm = paper_width_mm - PRINT_MARGIN_MM * 2
-        printable_height_mm = paper_height_mm - PRINT_MARGIN_MM * 2
+        return print_scale_denominator(
+            self.image.width,
+            self.image.height,
+            self.meters_per_pixel,
+            paper_width_mm,
+            paper_height_mm,
+            PRINT_MARGIN_MM,
+        )
 
-        if printable_width_mm <= 0 or printable_height_mm <= 0:
-            return None
+    def get_printed_image_size_mm(self, scale_denominator):
+        """指定縮尺で画像全体を印刷した場合の用紙上サイズを返します。"""
 
-        real_width_mm = self.image.width * self.meters_per_pixel * 1000
-        real_height_mm = self.image.height * self.meters_per_pixel * 1000
+        return printed_image_size_mm(
+            self.image.width,
+            self.image.height,
+            self.meters_per_pixel,
+            scale_denominator,
+        )
 
-        width_scale = real_width_mm / printable_width_mm
-        height_scale = real_height_mm / printable_height_mm
+    def image_fits_paper_at_scale(self, paper_width_mm, paper_height_mm, scale_denominator):
+        """指定した用紙・縮尺で画像全体が印刷範囲に収まるかを返します。"""
 
-        return max(width_scale, height_scale)
+        return calc_image_fits_paper_at_scale(
+            self.image.width,
+            self.image.height,
+            self.meters_per_pixel,
+            paper_width_mm,
+            paper_height_mm,
+            PRINT_MARGIN_MM,
+            scale_denominator,
+        )
 
-    def get_reference_scale_message(self):
+    def get_nearest_standard_scale(self, denominator):
+        """参考縮尺分母に一番近い土木標準縮尺分母を返します。"""
+
+        return nearest_standard_scale(denominator, CIVIL_STANDARD_SCALES)
+
+    def get_standard_scale_pair(self, denominator):
+        """参考縮尺を挟む標準縮尺の候補を返します。"""
+
+        return standard_scale_pair(denominator, CIVIL_STANDARD_SCALES)
+
+    def format_standard_scale_recommendation(self, paper_label, denominator, compact=False):
+        """右側パネルへ出す標準縮尺の推奨文を作ります。"""
+
+        if denominator is None:
+            return f"{paper_label}: 計算不可"
+
+        nearest = self.get_nearest_standard_scale(denominator)
+        smaller, larger = self.get_standard_scale_pair(denominator)
+
+        if smaller is not None and larger is not None and smaller != larger:
+            if compact:
+                return f"{paper_label} 1/{nearest}"
+
+            return (
+                f"{paper_label}なら 1/{smaller} または 1/{larger}\n"
+                f"最寄り: 1/{nearest}"
+            )
+
+        if nearest is not None:
+            return f"{paper_label} 1/{nearest}" if compact else f"{paper_label}なら 1/{nearest}"
+
+        return f"{paper_label}: 計算不可"
+
+    def get_next_fitting_standard_scale(self, paper_width_mm, paper_height_mm):
+        """画像全体が収まる最小の土木標準縮尺分母を返します。"""
+
+        return next_fitting_standard_scale(
+            self.image.width,
+            self.image.height,
+            self.meters_per_pixel,
+            paper_width_mm,
+            paper_height_mm,
+            PRINT_MARGIN_MM,
+            CIVIL_STANDARD_SCALES,
+        )
+
+    def get_reference_scale_message(self, detailed=False):
         """右側パネルへ表示する座標換算と参考印刷縮尺を作ります。"""
 
-        lines = [
-            f"座標換算:\n1px = {self.meters_per_pixel:.4f}m",
-            "参考縮尺:",
-        ]
+        background_filename = os.path.basename(self.background_image_path)
+        paper_denominators = {}
+        lines = [f"背景: {background_filename}", f"換算: 1px={self.meters_per_pixel:.4f}m"]
 
+        if self.scale_needs_reset:
+            lines.append("縮尺再設定が必要")
+
+        reference_lines = []
         for label, (paper_width_mm, paper_height_mm) in PRINT_PAPER_SIZES_MM.items():
             denominator = self.get_print_scale_denominator(
                 paper_width_mm,
                 paper_height_mm,
             )
+            paper_denominators[label] = denominator
 
             if denominator is None:
                 scale_text = "計算不可"
             else:
                 scale_text = f"約1/{round(denominator):,}"
 
-            lines.append(f"{label} 全体印刷:\n{scale_text}")
+            reference_lines.append(f"{label}: {scale_text}")
+
+        lines.append("参考: " + " / ".join(reference_lines))
+
+        a3_recommendation = self.format_standard_scale_recommendation(
+            "A3",
+            paper_denominators.get("A3横"),
+            compact=not detailed,
+        )
+        lines.append("推奨: " + a3_recommendation)
+
+        if detailed:
+            lines.append("標準: 1/250, 1/500, 1/1000, 1/2500, 1/5000")
+            lines.append(
+                "A4: "
+                + self.format_standard_scale_recommendation(
+                    "A4",
+                    paper_denominators.get("A4横"),
+                    compact=True,
+                )
+            )
+
+
+        a3_width_mm, a3_height_mm = PRINT_PAPER_SIZES_MM["A3横"]
+        fits_a3_500 = self.image_fits_paper_at_scale(
+            a3_width_mm,
+            a3_height_mm,
+            A3_FOCUS_SCALE,
+        )
+
+        if fits_a3_500:
+            lines.append("A3 1/500: 収まる")
+        else:
+            next_scale = self.get_next_fitting_standard_scale(
+                a3_width_mm,
+                a3_height_mm,
+            )
+            if next_scale is None:
+                lines.append("A3 1/500: 不可")
+            else:
+                lines.append(f"A3 1/500: 不可 -> 1/{next_scale}")
+
+        lines.append("※印刷・図面作成の目安")
 
         return "\n".join(lines)
+
+    def normalize_image_path(self, image_path):
+        """config.json の画像パスをアプリ起点の絶対パスへそろえます。"""
+
+        if os.path.isabs(image_path):
+            return os.path.normpath(image_path)
+
+        return os.path.abspath(image_path)
+
+    def get_image_identity(self, image_path):
+        """縮尺の使い回し判定に使う画像名を返します。"""
+
+        return os.path.basename(os.path.normpath(image_path))
+
+    def get_storable_image_path(self, image_path):
+        """プロジェクト内の画像は config.json へ相対パスで保存します。"""
+
+        absolute_path = self.normalize_image_path(image_path)
+        cwd = os.path.abspath(os.getcwd())
+
+        try:
+            common_path = os.path.commonpath([cwd, absolute_path])
+        except ValueError:
+            return absolute_path
+
+        if common_path == cwd:
+            return os.path.relpath(absolute_path, cwd)
+
+        return absolute_path
+
+    def load_config(self):
+        """背景画像パスを config.json から読み込みます。
+
+        config.json が無い場合は従来どおり map.png を使います。
+        """
+
+        default_image_path = self.normalize_image_path(DEFAULT_IMAGE_FILE)
+
+        if not os.path.exists(CONFIG_FILE):
+            return default_image_path
+
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            print(f"{CONFIG_FILE} を読み込めませんでした。{DEFAULT_IMAGE_FILE} を使います")
+            return default_image_path
+
+        configured_path = data.get("background_image")
+
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            print(f"{CONFIG_FILE} の背景画像パスが不正です。{DEFAULT_IMAGE_FILE} を使います")
+            return default_image_path
+
+        image_path = self.normalize_image_path(configured_path.strip())
+
+        if not os.path.exists(image_path):
+            print(
+                f"背景画像が見つかりません: {image_path}\n"
+                f"{DEFAULT_IMAGE_FILE} を使います"
+            )
+            return default_image_path
+
+        return image_path
+
+    def save_config(self):
+        """現在の背景画像パスを config.json に保存します。"""
+
+        data = {
+            "background_image": self.get_storable_image_path(self.background_image_path),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            print(f"{CONFIG_FILE} を保存できませんでした: {error}")
+            return
+
+        debug_log(f"背景画像設定を保存しました: {CONFIG_FILE}")
 
     def load_scale_settings(self):
         """前回保存した縮尺設定を scale.json から読み込みます。
@@ -296,12 +555,39 @@ class SimpleCadApp:
             return
 
         loaded_scale = data.get("meters_per_pixel")
+        scale_image_file = data.get("image_file")
+
+        if isinstance(scale_image_file, str) and scale_image_file.strip():
+            previous_image_path = self.normalize_image_path(scale_image_file)
+            current_image_path = self.normalize_image_path(self.background_image_path)
+
+            if previous_image_path != current_image_path:
+                self.scale_needs_reset = True
+                self.scale_reset_message = (
+                    "背景画像が前回縮尺設定時と違うため、縮尺再設定が必要です"
+                )
+                previous_image_name = self.get_image_identity(previous_image_path)
+                current_image_name = self.get_image_identity(current_image_path)
+                print(
+                    f"{self.scale_reset_message}: "
+                    f"{previous_image_name} -> {current_image_name}"
+                )
+                return
+        elif self.get_image_identity(self.background_image_path) != DEFAULT_IMAGE_FILE:
+            self.scale_needs_reset = True
+            self.scale_reset_message = (
+                "縮尺設定に背景画像名が無いため、縮尺再設定が必要です"
+            )
+            print(self.scale_reset_message)
+            return
 
         if not isinstance(loaded_scale, (int, float)) or loaded_scale <= 0:
             print(f"{SCALE_FILE} の縮尺値が不正です。初期縮尺を使います")
             return
 
         self.meters_per_pixel = float(loaded_scale)
+        self.scale_needs_reset = False
+        self.scale_reset_message = ""
         print(f"前回の縮尺を読み込みました: 1px = {self.meters_per_pixel:.4f}m")
 
     def save_scale_settings(self):
@@ -309,7 +595,8 @@ class SimpleCadApp:
 
         data = {
             "meters_per_pixel": self.meters_per_pixel,
-            "image_file": IMAGE_FILE,
+            "image_file": self.get_storable_image_path(self.background_image_path),
+            "image_filename": self.get_image_identity(self.background_image_path),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -321,6 +608,222 @@ class SimpleCadApp:
             return
 
         print(f"縮尺設定を保存しました: {SCALE_FILE}")
+
+    def serialize_points(self, points):
+        """JSON保存用に点列を [x, y] の配列へそろえます。"""
+
+        return [[float(x), float(y)] for x, y in points]
+
+    def deserialize_points(self, points):
+        """project.json の点列をアプリ内部の (x, y) へ戻します。"""
+
+        restored_points = []
+
+        if not isinstance(points, list):
+            return restored_points
+
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+
+            x, y = point
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                continue
+
+            restored_points.append((float(x), float(y)))
+
+        return restored_points
+
+    def serialize_lines(self):
+        """確定済み図形を project.json 用のデータへ変換します。"""
+
+        serialized_lines = []
+
+        for line in self.lines:
+            layer = line.get("layer", {})
+            layer_name = layer.get("name")
+            layer_key = self.get_layer_key_by_name(layer_name)
+
+            serialized_lines.append(
+                {
+                    "layer_key": layer_key,
+                    "layer": layer,
+                    "points": self.serialize_points(line.get("points", [])),
+                    "closed": bool(line.get("closed", False)),
+                }
+            )
+
+        return serialized_lines
+
+    def deserialize_lines(self, lines):
+        """project.json の図形データをアプリ内部形式へ戻します。"""
+
+        restored_lines = []
+
+        if not isinstance(lines, list):
+            return restored_lines
+
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+
+            points = self.deserialize_points(line.get("points", []))
+            if len(points) < 2:
+                continue
+
+            layer_key = line.get("layer_key")
+            layer = None
+
+            if isinstance(layer_key, str) and layer_key in LAYERS:
+                layer = LAYERS[layer_key].copy()
+            elif isinstance(line.get("layer"), dict):
+                layer = line["layer"].copy()
+
+            if layer is None:
+                layer = self.current_layer().copy()
+
+            restored_lines.append(
+                {
+                    "layer": layer,
+                    "points": points,
+                    "closed": bool(line.get("closed", False)),
+                }
+            )
+
+        return restored_lines
+
+    def get_layer_key_by_name(self, layer_name):
+        """DXFレイヤ名からアプリのレイヤキーを探します。"""
+
+        for key, layer in LAYERS.items():
+            if layer.get("name") == layer_name:
+                return key
+
+        return self.current_layer_key
+
+    def get_existing_project_created_at(self):
+        """既存project.jsonの作成日時があれば引き継ぎます。"""
+
+        if not os.path.exists(PROJECT_FILE):
+            return None
+
+        try:
+            with open(PROJECT_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        created_at = data.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            return created_at
+
+        return None
+
+    def build_project_data(self):
+        """現在の作業状態を project.json 用の辞書へまとめます。"""
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        return {
+            "background_image": self.get_storable_image_path(self.background_image_path),
+            "meters_per_pixel": self.meters_per_pixel,
+            "current_layer": self.current_layer_key,
+            "lines": self.serialize_lines(),
+            "current_points": self.serialize_points(self.current_points),
+            "layers": LAYERS,
+            "created_at": self.get_existing_project_created_at() or now,
+            "updated_at": now,
+        }
+
+    def save_project(self):
+        """作業途中の状態を project.json に保存します。"""
+
+        data = self.build_project_data()
+
+        try:
+            with open(PROJECT_FILE, "w", encoding="utf-8") as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            print(f"{PROJECT_FILE} を保存できませんでした: {error}")
+            self.show_temporary_notice("作業を保存できませんでした")
+            return
+
+        print(f"作業を保存しました: {PROJECT_FILE}")
+        self.show_temporary_notice("作業を保存しました")
+
+    def load_project(self, auto=False, show_notice=True, redraw=True):
+        """project.json から作業途中の状態を読み込みます。"""
+
+        if not os.path.exists(PROJECT_FILE):
+            if not auto:
+                print(f"{PROJECT_FILE} がありません")
+                if show_notice:
+                    self.show_temporary_notice("project.json がありません")
+            return False
+
+        try:
+            with open(PROJECT_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"{PROJECT_FILE} を読み込めませんでした: {error}")
+            if show_notice:
+                self.show_temporary_notice("作業を読み込めませんでした")
+            return False
+
+        warning_message = self.get_project_background_warning(data)
+        if warning_message:
+            print(warning_message)
+
+        meters_per_pixel = data.get("meters_per_pixel")
+        if isinstance(meters_per_pixel, (int, float)) and meters_per_pixel > 0:
+            self.meters_per_pixel = float(meters_per_pixel)
+
+        current_layer = data.get("current_layer")
+        if isinstance(current_layer, str) and current_layer in LAYERS:
+            self.current_layer_key = current_layer
+
+        self.lines = self.deserialize_lines(data.get("lines", []))
+        self.current_points = self.deserialize_points(data.get("current_points", []))
+        self.selected_point = None
+        self.scale_mode = False
+        self.scale_points = []
+        self.interaction_mode = "drawing" if self.current_points else "idle"
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
+        print(f"作業を読み込みました: {PROJECT_FILE}")
+
+        if show_notice:
+            message = "作業を読み込みました"
+            if warning_message:
+                message += "\n背景画像が違います"
+            self.show_temporary_notice(message)
+
+        if redraw:
+            self.redraw(reset_view=True)
+        else:
+            self.update_layer_ui()
+
+        return True
+
+    def get_project_background_warning(self, data):
+        """project.json と現在設定の背景画像が違う場合の警告文を返します。"""
+
+        project_background = data.get("background_image")
+        if not isinstance(project_background, str) or not project_background.strip():
+            return None
+
+        project_path = self.normalize_image_path(project_background)
+        current_path = self.normalize_image_path(self.background_image_path)
+
+        if project_path == current_path:
+            return None
+
+        return (
+            "警告: project.json の背景画像が現在の背景画像と違います: "
+            f"{self.get_image_identity(project_path)} -> "
+            f"{self.get_image_identity(current_path)}"
+        )
 
     def get_toolbar_mode(self):
         """matplotlibツールバーの現在モードを文字列で返します。"""
@@ -351,14 +854,14 @@ class SimpleCadApp:
         try:
             if "pan" in mode_text:
                 toolbar.pan()
-                print("ツールバーのPanモードを解除しました")
+                debug_log("ツールバーのPanモードを解除しました")
             elif "zoom" in mode_text:
                 toolbar.zoom()
-                print("ツールバーのZoomモードを解除しました")
+                debug_log("ツールバーのZoomモードを解除しました")
         except Exception as error:
             # ツールバー実装はバックエンドで少し差があります。
             # 解除に失敗してもアプリ自体は続行します。
-            print(f"ツールバー状態の解除に失敗しました: {error}")
+            debug_log(f"ツールバー状態の解除に失敗しました: {error}")
 
     def debug_click_event(self, event, reason=""):
         """クリック処理の状態をターミナルへ出します。
@@ -367,7 +870,7 @@ class SimpleCadApp:
         どこで無視されたかを追いやすくなります。
         """
 
-        print(
+        debug_log(
             "[click-debug] "
             f"reason={reason} | "
             f"interaction_mode={self.interaction_mode} | "
@@ -390,7 +893,7 @@ class SimpleCadApp:
     def debug_app_state(self, reason):
         """イベント無しの状態確認ログを出します。"""
 
-        print(
+        debug_log(
             f"[state-debug] reason={reason} | "
             f"interaction_mode={self.interaction_mode} | "
             f"current_layer={self.current_layer()['label']} | "
@@ -440,26 +943,54 @@ class SimpleCadApp:
     def setup_widgets(self):
         """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
 
+        self.operation_title_text = self.fig.text(
+            0.835,
+            0.955,
+            "操作",
+            fontsize=12,
+            fontweight="bold",
+            color="#222222",
+        )
         self.layer_title_text = self.fig.text(
             0.835,
-            0.93,
+            0.64,
             "",
+            fontsize=12,
+            fontweight="bold",
+            color="#222222",
+        )
+        self.info_title_text = self.fig.text(
+            0.835,
+            0.345,
+            "情報",
             fontsize=12,
             fontweight="bold",
             color="#222222",
         )
         self.scale_reference_text = self.fig.text(
             0.835,
-            0.66,
+            0.255,
             "",
-            fontsize=9,
+            fontsize=8.5,
             color="#222222",
             va="top",
+            linespacing=1.25,
         )
+
+        save_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.90, 0.14, 0.045]))
+        project_save_ax = self.register_ui_axes(
+            self.fig.add_axes([0.84, 0.845, 0.14, 0.045])
+        )
+        project_load_ax = self.register_ui_axes(
+            self.fig.add_axes([0.84, 0.79, 0.14, 0.045])
+        )
+        scale_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.735, 0.14, 0.045]))
+        undo_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.68, 0.065, 0.04]))
+        redo_ax = self.register_ui_axes(self.fig.add_axes([0.915, 0.68, 0.065, 0.04]))
 
         for index, (key, layer) in enumerate(LAYERS.items()):
             layer_ax = self.register_ui_axes(
-                self.fig.add_axes([0.84, 0.84 - index * 0.055, 0.14, 0.045])
+                self.fig.add_axes([0.84, 0.585 - index * 0.055, 0.14, 0.045])
             )
             button = Button(layer_ax, layer["label"])
             button.on_clicked(
@@ -470,17 +1001,19 @@ class SimpleCadApp:
             )
             self.layer_buttons[key] = button
 
-        save_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.46, 0.14, 0.045]))
-        undo_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.40, 0.065, 0.045]))
-        redo_ax = self.register_ui_axes(self.fig.add_axes([0.915, 0.40, 0.065, 0.045]))
-        close_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.34, 0.14, 0.045]))
-        scale_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.28, 0.14, 0.045]))
+        close_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.365, 0.14, 0.045]))
+        info_detail_ax = self.register_ui_axes(
+            self.fig.add_axes([0.84, 0.295, 0.14, 0.04])
+        )
 
         self.save_button = Button(save_ax, "DXF保存")
         self.undo_button = Button(undo_ax, "Undo")
         self.redo_button = Button(redo_ax, "Redo")
         self.close_button = Button(close_ax, "閉じて確定")
         self.scale_button = Button(scale_ax, "縮尺設定")
+        self.project_save_button = Button(project_save_ax, "作業保存")
+        self.project_load_button = Button(project_load_ax, "作業読込")
+        self.info_detail_button = Button(info_detail_ax, "詳細表示")
 
         self.save_button.on_clicked(
             self.safe_callback("save_dxf", lambda event: self.save_dxf())
@@ -499,6 +1032,15 @@ class SimpleCadApp:
         )
         self.scale_button.on_clicked(
             self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode())
+        )
+        self.project_save_button.on_clicked(
+            self.safe_callback("save_project", lambda event: self.save_project())
+        )
+        self.project_load_button.on_clicked(
+            self.safe_callback("load_project", lambda event: self.load_project())
+        )
+        self.info_detail_button.on_clicked(
+            self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail())
         )
         self.update_layer_ui()
 
@@ -520,19 +1062,36 @@ class SimpleCadApp:
 
         if self.layer_title_text is not None:
             self.layer_title_text.set_text(
-                f"現在レイヤ:\n{self.current_layer()['label']}"
+                f"レイヤ: {self.current_layer()['label']}"
             )
 
         if self.scale_reference_text is not None:
-            self.scale_reference_text.set_text(self.get_reference_scale_message())
+            self.scale_reference_text.set_text(
+                self.get_reference_scale_message(detailed=self.info_detail_expanded)
+            )
+
+        if self.info_detail_button is not None:
+            self.info_detail_button.label.set_text(
+                "詳細を隠す" if self.info_detail_expanded else "詳細表示"
+            )
 
         for key, button in self.layer_buttons.items():
             is_current = key == self.current_layer_key
-            button.ax.set_facecolor("#ffe8e8" if is_current else "#f2f2f2")
-            button.color = "#ffe8e8" if is_current else "#f2f2f2"
-            button.hovercolor = "#ffd6d6" if is_current else "#e6e6e6"
+            button.ax.set_facecolor("#ffe8e8" if is_current else "#f4f4f4")
+            button.color = "#ffe8e8" if is_current else "#f4f4f4"
+            button.hovercolor = "#ffd6d6" if is_current else "#e8e8e8"
             button.label.set_fontweight("bold" if is_current else "normal")
             button.label.set_color("#b00020" if is_current else "#222222")
+            for spine in button.ax.spines.values():
+                spine.set_edgecolor("#b00020" if is_current else "#bdbdbd")
+                spine.set_linewidth(1.8 if is_current else 0.8)
+
+    def toggle_info_detail(self):
+        """右側情報欄の詳細表示を切り替えます。"""
+
+        self.info_detail_expanded = not self.info_detail_expanded
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
 
     def get_image_event_point(self, event):
         """画像axes上のクリック座標を返します。
@@ -585,12 +1144,12 @@ class SimpleCadApp:
             ),
             "close_event": canvas.mpl_connect("close_event", self.on_figure_close),
         }
-        print(f"[event-connected] {self.event_cids}")
+        debug_log(f"[event-connected] {self.event_cids}")
 
     def on_figure_close(self, event):
         """figure が閉じられた瞬間に理由追跡用ログを出します。"""
 
-        print(
+        debug_log(
             "[figure-close] "
             f"event={event} | "
             f"interaction_mode={self.interaction_mode} | "
@@ -651,13 +1210,16 @@ class SimpleCadApp:
             xlim = None
             ylim = None
 
+        self.crosshair_horizontal = None
+        self.crosshair_vertical = None
+        self.crosshair_center = None
         self.ax.clear()
         self.ax.imshow(self.image)
         self.ax.set_aspect("equal", adjustable="box")
 
         self.ax.set_title(
             "左クリック=点追加/点選択  右クリック=線確定  Space+ドラッグ=移動  "
-            "ホイール=ズーム  Esc=キャンセル  Delete=点削除",
+            "ホイール=ズーム  Esc=キャンセル  Delete=点削除  クロス中心で作図",
             fontsize=10,
         )
 
@@ -674,12 +1236,13 @@ class SimpleCadApp:
             self.ax.set_ylim(ylim)
 
         self.draw_overlay()
+        self.draw_crosshair()
         self.draw_status_bar()
         self.update_layer_ui()
         self.fig.canvas.draw_idle()
 
         self.is_redrawing = False
-        print(
+        debug_log(
             "[after-redraw] "
             f"interaction_mode={self.interaction_mode} | "
             f"current_layer={self.current_layer()['label']} | "
@@ -722,6 +1285,177 @@ class SimpleCadApp:
         self.pan_draw_pending = False
         self.pan_timer = None
         return False
+
+    def set_canvas_cursor(self, cursor):
+        """バックエンド差を吸収しながらカーソル形状を切り替えます。"""
+
+        try:
+            self.fig.canvas.set_cursor(cursor)
+        except Exception:
+            pass
+
+    def set_crosshair_cursor(self, enabled):
+        """画像上では細かいトレース向けの十字カーソルにします。"""
+
+        if enabled and self.crosshair_mode == "full":
+            cursor = cursors.SELECT_REGION
+        else:
+            cursor = cursors.POINTER
+        self.set_canvas_cursor(cursor)
+
+    def is_full_crosshair_mode(self):
+        """画面全体の十字線を出すモードかどうかを返します。"""
+
+        return self.crosshair_mode == "full"
+
+    def get_crosshair_event_point(self, event):
+        """イベント位置から十字ガイド中心の画像座標を返します。
+
+        small モードではOSカーソルと重ならないように表示中心を少し右下へずらし、
+        そのずらした中心を実際の作図座標として扱います。
+        """
+
+        image_point = self.get_image_event_point(event)
+        if image_point is None:
+            return None
+
+        if not self.crosshair_enabled or self.crosshair_mode != "small":
+            return image_point
+
+        if getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+            return image_point
+
+        offset_x, offset_y = CROSSHAIR_SMALL_OFFSET_PX
+        x, y = self.image_ax.transData.inverted().transform(
+            (event.x + offset_x, event.y - offset_y)
+        )
+
+        return (
+            min(max(x, 0), self.image.width),
+            min(max(y, 0), self.image.height),
+        )
+
+    def get_crosshair_screen_point(self, event):
+        """点選択判定用に、十字中心の画面座標を返します。"""
+
+        point = self.get_crosshair_event_point(event)
+        if point is None:
+            return None
+
+        return self.ax.transData.transform(point)
+
+    def draw_crosshair(self):
+        """マウス位置に追従する十字ガイドを描画します。"""
+
+        if not self.crosshair_enabled or self.crosshair_image_point is None:
+            return
+
+        x, y = self.crosshair_image_point
+        self.crosshair_horizontal = self.ax.axhline(
+            y,
+            color="#111111",
+            linewidth=CROSSHAIR_LINE_WIDTH,
+            alpha=0.50,
+            linestyle="-",
+            picker=False,
+            visible=self.is_full_crosshair_mode(),
+            zorder=28,
+        )
+        self.crosshair_vertical = self.ax.axvline(
+            x,
+            color="#111111",
+            linewidth=CROSSHAIR_LINE_WIDTH,
+            alpha=0.50,
+            linestyle="-",
+            picker=False,
+            visible=self.is_full_crosshair_mode(),
+            zorder=28,
+        )
+        self.crosshair_center = self.ax.plot(
+            x,
+            y,
+            "+",
+            color="#111111",
+            markeredgecolor="#111111",
+            markeredgewidth=1.4,
+            markersize=CROSSHAIR_CENTER_SIZE,
+            picker=False,
+            zorder=29,
+        )[0]
+        self.crosshair_dot = self.ax.plot(
+            x,
+            y,
+            "o",
+            color="#fff45c",
+            markeredgecolor="#111111",
+            markeredgewidth=0.7,
+            markersize=CROSSHAIR_DOT_SIZE,
+            picker=False,
+            zorder=30,
+        )[0]
+
+    def update_crosshair(self):
+        """既存の十字ガイドを動かし、必要な時だけ再作成します。"""
+
+        if not self.crosshair_enabled or self.crosshair_image_point is None:
+            for artist in (
+                self.crosshair_horizontal,
+                self.crosshair_vertical,
+                self.crosshair_center,
+                self.crosshair_dot,
+            ):
+                if artist is not None:
+                    artist.set_visible(False)
+            return
+
+        if (
+            self.crosshair_horizontal is None
+            or self.crosshair_vertical is None
+            or self.crosshair_center is None
+            or self.crosshair_dot is None
+        ):
+            self.draw_crosshair()
+            return
+
+        x, y = self.crosshair_image_point
+        show_full_lines = self.is_full_crosshair_mode()
+        self.crosshair_horizontal.set_visible(show_full_lines)
+        self.crosshair_vertical.set_visible(show_full_lines)
+        self.crosshair_center.set_visible(True)
+        self.crosshair_dot.set_visible(True)
+        self.crosshair_horizontal.set_ydata([y, y])
+        self.crosshair_vertical.set_xdata([x, x])
+        self.crosshair_center.set_data([x], [y])
+        self.crosshair_dot.set_data([x], [y])
+
+    def should_draw_crosshair_now(self):
+        """マウス移動時の描画頻度を抑えてちらつきを減らします。"""
+
+        now = time.monotonic()
+        interval = CROSSHAIR_UPDATE_INTERVAL_MS / 1000
+        if now - self.crosshair_last_draw_at < interval:
+            return False
+
+        self.crosshair_last_draw_at = now
+        return True
+
+    def toggle_crosshair(self):
+        """xキーで十字ガイドの表示を切り替えます。"""
+
+        self.crosshair_enabled = not self.crosshair_enabled
+        if not self.crosshair_enabled:
+            self.set_crosshair_cursor(False)
+        elif self.mouse_image_point is not None:
+            self.set_crosshair_cursor(True)
+            self.crosshair_image_point = self.get_active_drawing_point()
+
+        print(
+            f"十字ガイド: {'ON' if self.crosshair_enabled else 'OFF'} "
+            f"({self.crosshair_mode})"
+        )
+        self.update_crosshair()
+        self.draw_status_bar()
+        self.fig.canvas.draw_idle()
 
     def show_temporary_notice(self, message, duration_ms=3000):
         """操作完了などの一時メッセージを画面上に表示します。"""
@@ -890,22 +1624,38 @@ class SimpleCadApp:
             if len(draw_pts) >= 2:
                 xs = [p[0] for p in draw_pts]
                 ys = [p[1] for p in draw_pts]
-                self.ax.plot(xs, ys, "-", color=color, linewidth=2)
+                self.ax.plot(
+                    xs,
+                    ys,
+                    "-",
+                    color=color,
+                    linewidth=CONFIRMED_LINE_WIDTH,
+                    zorder=10,
+                )
 
                 if is_closed:
                     self.ax.fill(xs, ys, color=color, alpha=0.12)
 
             for point_index, (x, y) in enumerate(pts):
                 marker = "o"
-                marker_size = 4
+                marker_size = CONFIRMED_MARKER_SIZE
                 marker_color = color
 
                 if self.selected_point == ("line", line_index, point_index):
                     marker = "s"
-                    marker_size = 8
+                    marker_size = SELECTED_MARKER_SIZE
                     marker_color = "#000000"
 
-                self.ax.plot(x, y, marker, color=marker_color, markersize=marker_size)
+                self.ax.plot(
+                    x,
+                    y,
+                    marker,
+                    color=marker_color,
+                    markeredgecolor="#ffffff",
+                    markeredgewidth=MARKER_EDGE_WIDTH,
+                    markersize=marker_size,
+                    zorder=11,
+                )
 
     def draw_current_line(self):
         """作図中の線を描画します。"""
@@ -923,18 +1673,18 @@ class SimpleCadApp:
                 ys,
                 "-",
                 color=color,
-                linewidth=3.5,
+                linewidth=CURRENT_LINE_WIDTH,
                 zorder=12,
             )
 
         for point_index, (x, y) in enumerate(self.current_points):
             marker = "o"
-            marker_size = 10
+            marker_size = CURRENT_MARKER_SIZE
             marker_color = color
 
             if self.selected_point == ("current", point_index):
                 marker = "s"
-                marker_size = 11
+                marker_size = SELECTED_MARKER_SIZE
                 marker_color = "#000000"
 
             self.ax.plot(
@@ -943,7 +1693,7 @@ class SimpleCadApp:
                 marker,
                 color=marker_color,
                 markeredgecolor="#ffffff",
-                markeredgewidth=2,
+                markeredgewidth=MARKER_EDGE_WIDTH,
                 markersize=marker_size,
                 zorder=13,
             )
@@ -1068,8 +1818,8 @@ class SimpleCadApp:
                 "o",
                 color="#006bff",
                 markeredgecolor="#ffffff",
-                markeredgewidth=2,
-                markersize=13,
+                markeredgewidth=MARKER_EDGE_WIDTH,
+                markersize=SCALE_MARKER_SIZE,
                 zorder=15,
             )
             self.ax.text(
@@ -1092,7 +1842,7 @@ class SimpleCadApp:
                 ys,
                 color="#006bff",
                 linestyle="--",
-                linewidth=3,
+                linewidth=SCALE_LINE_WIDTH,
                 zorder=14,
             )
 
@@ -1180,7 +1930,7 @@ class SimpleCadApp:
         if self.is_redrawing and not is_scaling:
             self.debug_click_event(event, reason="continued:during_redraw")
 
-        image_point = self.get_image_event_point(event)
+        image_point = self.get_crosshair_event_point(event)
 
         if image_point is None:
             if is_scaling:
@@ -1243,7 +1993,7 @@ class SimpleCadApp:
         self.scale_mode = False
         self.scale_points = []
         self.interaction_mode = "drawing"
-        print(
+        debug_log(
             "[draw-point-added] "
             f"interaction_mode={self.interaction_mode} | "
             f"scale_mode={self.scale_mode} | "
@@ -1266,12 +2016,24 @@ class SimpleCadApp:
             self.interaction_mode = "idle"
 
     def on_mouse_move(self, event):
-        """マウス移動時の処理です。今はPanだけ扱います。"""
+        """マウス移動時に十字ガイド、座標表示、Panを更新します。"""
+
+        image_point = self.get_image_event_point(event)
+        self.mouse_image_point = image_point
+        self.crosshair_image_point = self.get_crosshair_event_point(event)
+        self.set_crosshair_cursor(image_point is not None and self.crosshair_enabled)
+        self.update_crosshair()
+        self.draw_status_bar()
+        should_draw = self.should_draw_crosshair_now()
 
         if not self.pan_active:
+            if should_draw:
+                self.fig.canvas.draw_idle()
             return
 
         if event.x is None or event.y is None:
+            if should_draw:
+                self.fig.canvas.draw_idle()
             return
 
         # Pan中に xlim/ylim を変えると event.xdata/ydata も変化します。
@@ -1296,6 +2058,7 @@ class SimpleCadApp:
             self.pan_start_ylim[1] - dy,
         )
 
+        self.update_crosshair()
         self.request_fast_canvas_draw()
 
     def on_scroll(self, event):
@@ -1330,6 +2093,8 @@ class SimpleCadApp:
             y_center + y_range * (1 - y_ratio),
         )
 
+        self.update_crosshair()
+        self.draw_status_bar()
         self.request_fast_canvas_draw()
 
     def start_pan(self, event, point=None):
@@ -1374,12 +2139,24 @@ class SimpleCadApp:
             self.redo()
             return
 
+        if key in ("ctrl+s", "cmd+s"):
+            self.save_project()
+            return
+
+        if key in ("ctrl+o", "cmd+o"):
+            self.load_project()
+            return
+
         if key in ("delete", "backspace"):
             self.delete_selected_point()
             return
 
         if key == "k":
             self.start_scale_mode()
+            return
+
+        if key == "x":
+            self.toggle_crosshair()
             return
 
         if key == "u":
@@ -1524,7 +2301,7 @@ class SimpleCadApp:
         self.draw_status_bar()
         self.fig.canvas.draw_idle()
         self.release_mouse_grab()
-        print(
+        debug_log(
             "[layer-change-complete] "
             f"interaction_mode={self.interaction_mode} | "
             f"current_layer={self.current_layer()['label']} | "
@@ -1567,7 +2344,10 @@ class SimpleCadApp:
         if not candidates:
             return None
 
-        click_xy = (event.x, event.y)
+        click_xy = self.get_crosshair_screen_point(event)
+        if click_xy is None:
+            return None
+
         nearest_ref = None
         nearest_distance = None
 
@@ -1649,8 +2429,8 @@ class SimpleCadApp:
         print("")
         print("=== 縮尺設定モード ===")
         print("距離が分かる2点をクリックしてください")
-        print(f"現在の interaction_mode: {self.interaction_mode}")
-        print(f"現在の toolbar.mode: {self.get_toolbar_mode()}")
+        debug_log(f"現在の interaction_mode: {self.interaction_mode}")
+        debug_log(f"現在の toolbar.mode: {self.get_toolbar_mode()}")
 
         self.redraw()
 
@@ -1772,6 +2552,8 @@ class SimpleCadApp:
 
         self.push_undo()
         self.meters_per_pixel = real_distance / pixel_distance
+        self.scale_needs_reset = False
+        self.scale_reset_message = ""
         self.save_scale_settings()
 
         print("")
@@ -1792,17 +2574,17 @@ class SimpleCadApp:
     def debug_scale_complete_state(self):
         """縮尺完了後に通常作図へ戻れているかをログへ出します。"""
 
-        print("")
-        print("[scale-complete]")
-        print(f"interaction_mode={self.interaction_mode}")
-        print(f"scale_mode={self.scale_mode}")
-        print(f"scale_points={len(self.scale_points)}")
-        print(f"scale_input_box={self.scale_input_box}")
-        print(f"scale_ok_button={self.scale_ok_button}")
-        print(f"current_layer={self.current_layer()['label']}")
-        print(f"success_message_active={self.is_notice_active()}")
-        print(f"redraw_scheduled={self.redraw_scheduled}")
-        print(f"is_redrawing={self.is_redrawing}")
+        debug_log("")
+        debug_log("[scale-complete]")
+        debug_log(f"interaction_mode={self.interaction_mode}")
+        debug_log(f"scale_mode={self.scale_mode}")
+        debug_log(f"scale_points={len(self.scale_points)}")
+        debug_log(f"scale_input_box={self.scale_input_box}")
+        debug_log(f"scale_ok_button={self.scale_ok_button}")
+        debug_log(f"current_layer={self.current_layer()['label']}")
+        debug_log(f"success_message_active={self.is_notice_active()}")
+        debug_log(f"redraw_scheduled={self.redraw_scheduled}")
+        debug_log(f"is_redrawing={self.is_redrawing}")
 
     def update_scale_input_prompt(self):
         """縮尺入力欄の案内文を更新します。"""
@@ -1855,16 +2637,16 @@ class SimpleCadApp:
         """DXFへ背景画像参照を追加します。
 
         注意:
-        DXFに画像ファイルそのものを埋め込むのではなく、map.png への参照を保存します。
-        AutoCAD / TREND-CORE 側で表示するには、DXFと map.png を同じフォルダに置く運用が安全です。
+        DXFに画像ファイルそのものを埋め込むのではなく、現在の背景画像への参照を保存します。
+        AutoCAD / TREND-CORE 側で表示するには、DXFと背景画像を同じフォルダに置く運用が安全です。
         """
 
-        if not os.path.exists(IMAGE_FILE):
+        if not os.path.exists(self.background_image_path):
             print("背景画像が見つからないため、DXF画像参照は追加しません")
             return
 
         image_def = doc.add_image_def(
-            filename=IMAGE_FILE,
+            filename=self.background_image_path,
             size_in_pixel=(self.image.width, self.image.height),
         )
 
@@ -1918,7 +2700,11 @@ class SimpleCadApp:
         print("")
         print(f"DXF保存完了: {filename}")
         print(f"保存時縮尺: 1px = {self.meters_per_pixel:.4f}m")
-        print("背景画像は外部参照です。DXFと map.png を同じフォルダで管理してください")
+        print(
+            "背景画像は外部参照です。DXFと "
+            f"{os.path.basename(self.background_image_path)} "
+            "を同じフォルダで管理してください"
+        )
 
     # --------------------------------------------------------
     # ヘルプ
@@ -1938,10 +2724,13 @@ class SimpleCadApp:
         print("Delete / Backspace: 選択点を削除")
         print("u / Cmd+Z / Ctrl+Z: Undo")
         print("r / Cmd+Shift+Z / Ctrl+Y: Redo")
+        print("Cmd+S / Ctrl+S: project.json保存")
+        print("Cmd+O / Ctrl+O: project.json読込")
         print("n: 線として確定")
         print("c: 閉じた面として確定")
         print("d: 選択点を削除。選択がなければ最後の線を削除")
         print("k: 縮尺設定")
+        print("x: 十字ガイド ON/OFF")
         print("1: 道路 / 2: 敷地 / 3: 法面 / 4: 構造物")
         print("Enter: DXF保存")
         print("q: 終了")
@@ -1953,14 +2742,14 @@ def main():
     disable_conflicting_matplotlib_shortcuts()
     app = SimpleCadApp()
     try:
-        print(
+        debug_log(
             "[mainloop-start] "
             f"manager_exists={app.fig.canvas.manager is not None} | "
             f"fignum_exists={plt.fignum_exists(app.fig.number)}"
         )
         plt.show()
     finally:
-        print(
+        debug_log(
             "[mainloop-ended] "
             f"manager_exists={app.fig.canvas.manager is not None} | "
             f"fignum_exists={plt.fignum_exists(app.fig.number)} | "

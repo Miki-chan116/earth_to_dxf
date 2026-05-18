@@ -1,0 +1,52 @@
+{
+  "background_image": "gsi_map.png",
+  "meters_per_pixel": 0.2505244546652514,
+  "current_layer": "1",
+  "lines": [],
+  "current_points": [
+    [
+      151.8027229532164,
+      341.6461988304095
+    ],
+    [
+      763.3597404970761,
+      411.31725146198846
+    ],
+    [
+      888.5095942982458,
+      739.0292397660821
+    ],
+    [
+      1062.6872258771932,
+      1026.7448830409357
+    ]
+  ],
+  "layers": {
+    "1": {
+      "name": "ROAD",
+      "label": "道路",
+      "color": 1,
+      "plot_color": "#d62728"
+    },
+    "2": {
+      "name": "SITE",
+      "label": "敷地",
+      "color": 3,
+      "plot_color": "#2ca02c"
+    },
+    "3": {
+      "name": "SLOPE",
+      "label": "法面",
+      "color": 5,
+      "plot_color": "#1f77b4"
+    },
+    "4": {
+      "name": "STRUCTURE",
+      "label": "構造物",
+      "color": 2,
+      "plot_color": "#ffbf00"
+    }
+  },
+  "created_at": "2026-05-18T20:45:47",
+  "updated_at": "2026-05-18T20:45:47"
+}
