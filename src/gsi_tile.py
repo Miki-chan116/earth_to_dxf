@@ -7,8 +7,17 @@ import os
 import ssl
 from urllib.request import urlopen
 
+from PIL import Image
+
 from src.config_store import get_storable_image_path, save_config
-from src.constants import ASSETS_DIR, SCALE_FILE
+from src.constants import (
+    ASSETS_DIR,
+    GSI_DEFAULT_LAT,
+    GSI_DEFAULT_LON,
+    GSI_DEFAULT_ZOOM,
+    GSI_SETTINGS_FILE,
+    SCALE_FILE,
+)
 
 GSI_TILE_BASE_URL = "https://cyberjapandata.gsi.go.jp/xyz"
 WEB_MERCATOR_MAX_LAT = 85.05112878
@@ -17,6 +26,112 @@ CA_CERTIFICATE_PATHS = (
     "/opt/homebrew/etc/ca-certificates/cert.pem",
     "/usr/local/etc/openssl@3/cert.pem",
 )
+ALLOWED_GRID_SIZES = {1, 3, 5}
+
+
+def default_gsi_settings():
+    """Return default GSI tile fetch settings."""
+
+    return {
+        "latitude": GSI_DEFAULT_LAT,
+        "longitude": GSI_DEFAULT_LON,
+        "zoom": GSI_DEFAULT_ZOOM,
+        "grid_size": 3,
+    }
+
+
+def validate_gsi_settings(lat, lon, zoom, grid_size):
+    """Validate and normalize GSI tile fetch settings."""
+
+    try:
+        latitude = float(lat)
+    except (TypeError, ValueError):
+        raise ValueError("緯度は数値で入力してください")
+
+    try:
+        longitude = float(lon)
+    except (TypeError, ValueError):
+        raise ValueError("経度は数値で入力してください")
+
+    try:
+        zoom_int = int(str(zoom).strip())
+    except (TypeError, ValueError):
+        raise ValueError("ズームは整数で入力してください")
+
+    try:
+        grid_size_int = int(str(grid_size).strip())
+    except (TypeError, ValueError):
+        raise ValueError("グリッドサイズは 1 / 3 / 5 のいずれかです")
+
+    if not -WEB_MERCATOR_MAX_LAT <= latitude <= WEB_MERCATOR_MAX_LAT:
+        raise ValueError(
+            f"緯度は -{WEB_MERCATOR_MAX_LAT:.6f} から "
+            f"{WEB_MERCATOR_MAX_LAT:.6f} の範囲です"
+        )
+
+    if not -180.0 <= longitude <= 180.0:
+        raise ValueError("経度は -180 から 180 の範囲です")
+
+    if zoom_int < 0:
+        raise ValueError("ズームは0以上の整数で入力してください")
+
+    if grid_size_int not in ALLOWED_GRID_SIZES:
+        raise ValueError("グリッドサイズは 1 / 3 / 5 のいずれかです")
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "zoom": zoom_int,
+        "grid_size": grid_size_int,
+    }
+
+
+def load_gsi_settings(path=GSI_SETTINGS_FILE):
+    """Load saved GSI tile fetch settings."""
+
+    settings = default_gsi_settings()
+
+    if not os.path.exists(path):
+        return settings
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"{path} を読み込めませんでした: {error}")
+        return settings
+
+    if not isinstance(data, dict):
+        return settings
+
+    try:
+        return validate_gsi_settings(
+            data.get("latitude", settings["latitude"]),
+            data.get("longitude", settings["longitude"]),
+            data.get("zoom", settings["zoom"]),
+            data.get("grid_size", settings["grid_size"]),
+        )
+    except ValueError as error:
+        print(f"{path} の設定が不正です: {error}")
+        return settings
+
+
+def save_gsi_settings(settings, path=GSI_SETTINGS_FILE):
+    """Save GSI tile fetch settings."""
+
+    normalized = validate_gsi_settings(
+        settings.get("latitude"),
+        settings.get("longitude"),
+        settings.get("zoom"),
+        settings.get("grid_size"),
+    )
+    data = dict(normalized)
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+
+    return normalized
 
 
 def latlon_to_tile(lat, lon, zoom):
@@ -92,6 +207,74 @@ def build_tile_output_path(z, x, y, assets_dir=ASSETS_DIR):
     return os.path.join(assets_dir, f"gsi_tile_z{z}_x{x}_y{y}.png")
 
 
+def build_tile_grid_output_path(z, center_x, center_y, grid_size, assets_dir=ASSETS_DIR):
+    """Build the local merged tile grid output path."""
+
+    return os.path.join(
+        assets_dir,
+        f"gsi_tiles_z{z}_x{center_x}_y{center_y}_{grid_size}x{grid_size}.png",
+    )
+
+
+def get_tile_grid(center_x, center_y, zoom, grid_size=3):
+    """Return tile coordinates around the center tile."""
+
+    if grid_size not in ALLOWED_GRID_SIZES:
+        raise ValueError("grid_size must be one of 1, 3, or 5")
+
+    max_tile = (2 ** int(zoom)) - 1
+    radius = grid_size // 2
+    tiles = []
+
+    for row, tile_y in enumerate(range(center_y - radius, center_y + radius + 1)):
+        for col, tile_x in enumerate(range(center_x - radius, center_x + radius + 1)):
+            clamped_x = min(max(tile_x, 0), max_tile)
+            clamped_y = min(max(tile_y, 0), max_tile)
+            tiles.append(
+                {
+                    "x": clamped_x,
+                    "y": clamped_y,
+                    "row": row,
+                    "col": col,
+                }
+            )
+
+    return tiles
+
+
+def merge_tiles(tile_paths, output_path, grid_size=3):
+    """Merge downloaded tiles into one PNG image."""
+
+    if len(tile_paths) != grid_size * grid_size:
+        raise ValueError("tile_paths count does not match grid_size")
+
+    first_tile = Image.open(tile_paths[0]["path"])
+    tile_width, tile_height = first_tile.size
+    first_tile.close()
+
+    merged_image = Image.new(
+        "RGB",
+        (tile_width * grid_size, tile_height * grid_size),
+    )
+
+    for tile in tile_paths:
+        tile_image = Image.open(tile["path"]).convert("RGB")
+        merged_image.paste(
+            tile_image,
+            (tile["col"] * tile_width, tile["row"] * tile_height),
+        )
+        tile_image.close()
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    merged_image.save(output_path)
+    merged_image.close()
+
+    return output_path
+
+
 def build_scale_data(
     image_file,
     meters_per_pixel,
@@ -113,6 +296,33 @@ def build_scale_data(
         "zoom": zoom,
         "tile_x": tile_x,
         "tile_y": tile_y,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def build_grid_scale_data(
+    image_file,
+    meters_per_pixel,
+    lat,
+    lon,
+    zoom,
+    center_tile_x,
+    center_tile_y,
+    grid_size,
+):
+    """Build scale.json data for a fetched GSI tile grid."""
+
+    return {
+        "meters_per_pixel": meters_per_pixel,
+        "image_file": get_storable_image_path(image_file),
+        "image_filename": os.path.basename(image_file),
+        "source": "gsi_tile_grid",
+        "latitude": lat,
+        "longitude": lon,
+        "zoom": zoom,
+        "center_tile_x": center_tile_x,
+        "center_tile_y": center_tile_y,
+        "grid_size": grid_size,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -156,5 +366,65 @@ def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
         "zoom": zoom,
         "tile_x": tile_x,
         "tile_y": tile_y,
+        "scale_data": scale_data,
+    }
+
+
+def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
+    """Fetch a GSI tile grid, merge it, and update config.json and scale.json."""
+
+    zoom = int(zoom)
+    center_tile_x, center_tile_y = latlon_to_tile(lat, lon, zoom)
+    tiles = get_tile_grid(center_tile_x, center_tile_y, zoom, grid_size=grid_size)
+    downloaded_tiles = []
+
+    for tile in tiles:
+        url = tile_to_url(tile_type, zoom, tile["x"], tile["y"])
+        tile_path = build_tile_output_path(zoom, tile["x"], tile["y"])
+        download_tile(url, tile_path)
+        downloaded_tiles.append(
+            {
+                "path": tile_path,
+                "url": url,
+                "x": tile["x"],
+                "y": tile["y"],
+                "row": tile["row"],
+                "col": tile["col"],
+            }
+        )
+
+    output_path = build_tile_grid_output_path(
+        zoom,
+        center_tile_x,
+        center_tile_y,
+        grid_size,
+    )
+    merge_tiles(downloaded_tiles, output_path, grid_size=grid_size)
+
+    meters_per_pixel = calculate_meters_per_pixel(lat, zoom)
+    scale_data = build_grid_scale_data(
+        image_file=output_path,
+        meters_per_pixel=meters_per_pixel,
+        lat=lat,
+        lon=lon,
+        zoom=zoom,
+        center_tile_x=center_tile_x,
+        center_tile_y=center_tile_y,
+        grid_size=grid_size,
+    )
+
+    save_config({"background_image": get_storable_image_path(output_path)})
+    save_scale_data(scale_data)
+
+    return {
+        "image_file": output_path,
+        "meters_per_pixel": meters_per_pixel,
+        "latitude": lat,
+        "longitude": lon,
+        "zoom": zoom,
+        "center_tile_x": center_tile_x,
+        "center_tile_y": center_tile_y,
+        "grid_size": grid_size,
+        "tiles": downloaded_tiles,
         "scale_data": scale_data,
     }

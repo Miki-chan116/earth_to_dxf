@@ -7,6 +7,7 @@ OUTPUT_PREFIX = "output"
 CONFIG_FILE = "config.json"
 SCALE_FILE = "scale.json"
 PROJECT_FILE = "project.json"
+GSI_SETTINGS_FILE = "gsi_settings.json"
 ASSETS_DIR = "assets"
 
 GSI_DEFAULT_LAT = 33.839

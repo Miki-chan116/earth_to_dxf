@@ -58,7 +58,12 @@ from src.project_store import (
     save_project as save_project_file,
 )
 from src.dxf_export import export_dxf
-from src.gsi_tile import fetch_gsi_tile
+from src.gsi_tile import (
+    fetch_gsi_tile_grid,
+    load_gsi_settings,
+    save_gsi_settings,
+    validate_gsi_settings,
+)
 from src.scale_utils import (
     image_fits_paper_at_scale as calc_image_fits_paper_at_scale,
     nearest_standard_scale,
@@ -176,6 +181,15 @@ class SimpleCadApp:
         self.action_message = ""
         self.action_timer = None
         self.info_detail_expanded = False
+        self.gsi_settings = load_gsi_settings()
+        self.gsi_settings_visible = False
+        self.gsi_settings_texts = []
+        self.gsi_settings_axes = []
+        self.gsi_settings_boxes = {}
+        self.gsi_settings_ok_button = None
+        self.gsi_settings_cancel_button = None
+        self.gsi_settings_error_text = None
+        self.gsi_settings_button = None
         self.crosshair_mode = (
             CROSSHAIR_MODE if CROSSHAIR_MODE in CROSSHAIR_MODES else "small"
         )
@@ -240,6 +254,7 @@ class SimpleCadApp:
         self.redo_button = None
         self.close_button = None
         self.scale_button = None
+        self.gsi_settings_button = None
         self.gsi_tile_button = None
         self.project_save_button = None
         self.project_load_button = None
@@ -521,22 +536,32 @@ class SimpleCadApp:
             debug_log("背景画像設定を保存しました: config.json")
 
     def fetch_default_gsi_tile(self):
-        """コード上部の定数を使って地理院タイルを取得します。"""
+        """保存済みの設定を使って地理院タイルを取得します。"""
 
         if self.scale_mode:
             self.cancel_current_line()
 
+        if self.gsi_settings_visible:
+            if not self.apply_gsi_settings(close_on_success=False):
+                return
+
+        lat = self.gsi_settings["latitude"]
+        lon = self.gsi_settings["longitude"]
+        zoom = self.gsi_settings["zoom"]
+        grid_size = self.gsi_settings["grid_size"]
+
         print("")
         print(
             "地理院タイル取得開始: "
-            f"lat={GSI_DEFAULT_LAT}, lon={GSI_DEFAULT_LON}, zoom={GSI_DEFAULT_ZOOM}"
+            f"lat={lat}, lon={lon}, zoom={zoom}, grid={grid_size}x{grid_size}"
         )
 
-        result = fetch_gsi_tile(
-            GSI_DEFAULT_LAT,
-            GSI_DEFAULT_LON,
-            GSI_DEFAULT_ZOOM,
+        result = fetch_gsi_tile_grid(
+            lat,
+            lon,
+            zoom,
             tile_type=GSI_DEFAULT_TILE_TYPE,
+            grid_size=grid_size,
         )
 
         previous_image = self.image
@@ -554,15 +579,213 @@ class SimpleCadApp:
 
         print(f"地理院タイル取得完了: {result['image_file']}")
         print(
-            f"tile: z={result['zoom']} x={result['tile_x']} y={result['tile_y']}"
+            "center tile: "
+            f"z={result['zoom']} "
+            f"x={result['center_tile_x']} "
+            f"y={result['center_tile_y']} "
+            f"grid={result['grid_size']}x{result['grid_size']}"
         )
         print(f"縮尺を自動設定しました: 1px = {self.meters_per_pixel:.4f}m")
 
         self.show_temporary_notice(
-            "地理院タイルを取得しました\n"
+            f"地理院タイル{grid_size}x{grid_size}を取得しました\n"
             f"1px = {self.meters_per_pixel:.4f}m"
         )
         self.redraw(reset_view=True)
+
+    def toggle_gsi_settings_ui(self):
+        """地理院タイル取得設定の入力欄を開閉します。"""
+
+        if self.gsi_settings_visible:
+            self.cleanup_gsi_settings_ui()
+        else:
+            self.show_gsi_settings_ui()
+
+    def show_gsi_settings_ui(self):
+        """matplotlib画面内に地理院タイル取得設定フォームを表示します。"""
+
+        self.cleanup_gsi_settings_ui()
+        self.gsi_settings_visible = True
+
+        panel_x = 0.11
+        label_x = 0.12
+        input_x = 0.22
+        start_y = 0.82
+        row_gap = 0.055
+        input_width = 0.16
+        input_height = 0.035
+
+        title = self.fig.text(
+            panel_x,
+            start_y + 0.055,
+            "地理院タイル取得設定",
+            fontsize=12,
+            fontweight="bold",
+            color="#222222",
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "#ffffff",
+                "edgecolor": "#666666",
+                "alpha": 0.94,
+            },
+            zorder=30,
+        )
+        self.gsi_settings_texts.append(title)
+
+        fields = [
+            ("latitude", "緯度", self.gsi_settings["latitude"]),
+            ("longitude", "経度", self.gsi_settings["longitude"]),
+            ("zoom", "ズーム", self.gsi_settings["zoom"]),
+            ("grid_size", "グリッド", self.gsi_settings["grid_size"]),
+        ]
+
+        for index, (key, label, value) in enumerate(fields):
+            y = start_y - index * row_gap
+            label_text = self.fig.text(
+                label_x,
+                y + 0.008,
+                label,
+                fontsize=9,
+                color="#222222",
+                zorder=30,
+            )
+            self.gsi_settings_texts.append(label_text)
+
+            ax = self.register_ui_axes(
+                self.fig.add_axes([input_x, y, input_width, input_height])
+            )
+            textbox = TextBox(
+                ax,
+                "",
+                initial=str(value),
+                color="#ffffff",
+                hovercolor="#eef5ff",
+            )
+            self.gsi_settings_axes.append(ax)
+            self.gsi_settings_boxes[key] = textbox
+
+        help_text = self.fig.text(
+            label_x,
+            start_y - 4 * row_gap + 0.015,
+            "グリッドサイズは 1 / 3 / 5 のみ",
+            fontsize=8,
+            color="#333333",
+            zorder=30,
+        )
+        self.gsi_settings_texts.append(help_text)
+
+        self.gsi_settings_error_text = self.fig.text(
+            label_x,
+            start_y - 4 * row_gap - 0.015,
+            "",
+            fontsize=8,
+            color="#b00020",
+            zorder=30,
+        )
+
+        ok_button = self.create_panel_button(
+            "設定OK",
+            start_y - 4 * row_gap - 0.065,
+            self.safe_callback("apply_gsi_settings", lambda event: self.apply_gsi_settings()),
+            x=label_x,
+            width=0.12,
+            height=0.035,
+        )
+        cancel_button = self.create_panel_button(
+            "閉じる",
+            start_y - 4 * row_gap - 0.065,
+            self.safe_callback("close_gsi_settings", lambda event: self.cleanup_gsi_settings_ui()),
+            x=label_x + 0.135,
+            width=0.12,
+            height=0.035,
+        )
+        self.gsi_settings_ok_button = ok_button
+        self.gsi_settings_cancel_button = cancel_button
+        self.fig.canvas.draw_idle()
+
+    def cleanup_gsi_settings_ui(self):
+        """地理院タイル取得設定フォームを閉じます。"""
+
+        for textbox in self.gsi_settings_boxes.values():
+            try:
+                textbox.disconnect_events()
+            except Exception:
+                pass
+
+        for ax in self.gsi_settings_axes:
+            self.unregister_ui_axes(ax)
+            try:
+                ax.remove()
+            except ValueError:
+                pass
+
+        for button in (self.gsi_settings_ok_button, self.gsi_settings_cancel_button):
+            if button is not None:
+                self.unregister_ui_axes(button.ax)
+                try:
+                    button.disconnect_events()
+                except Exception:
+                    pass
+                try:
+                    button.ax.remove()
+                except ValueError:
+                    pass
+
+        for text in self.gsi_settings_texts:
+            try:
+                text.remove()
+            except ValueError:
+                pass
+
+        if self.gsi_settings_error_text is not None:
+            try:
+                self.gsi_settings_error_text.remove()
+            except ValueError:
+                pass
+
+        self.gsi_settings_texts = []
+        self.gsi_settings_axes = []
+        self.gsi_settings_boxes = {}
+        self.gsi_settings_ok_button = None
+        self.gsi_settings_cancel_button = None
+        self.gsi_settings_error_text = None
+        self.gsi_settings_visible = False
+        self.fig.canvas.draw_idle()
+
+    def apply_gsi_settings(self, close_on_success=True):
+        """入力された地理院タイル取得設定を検証して保存します。"""
+
+        try:
+            settings = validate_gsi_settings(
+                self.gsi_settings_boxes["latitude"].text,
+                self.gsi_settings_boxes["longitude"].text,
+                self.gsi_settings_boxes["zoom"].text,
+                self.gsi_settings_boxes["grid_size"].text,
+            )
+            self.gsi_settings = save_gsi_settings(settings)
+        except (KeyError, OSError, ValueError) as error:
+            message = str(error)
+            print(f"地理院設定エラー: {message}")
+            if self.gsi_settings_error_text is not None:
+                self.gsi_settings_error_text.set_text(message)
+            self.fig.canvas.draw_idle()
+            return False
+
+        print(
+            "地理院設定を保存しました: "
+            f"lat={self.gsi_settings['latitude']}, "
+            f"lon={self.gsi_settings['longitude']}, "
+            f"zoom={self.gsi_settings['zoom']}, "
+            f"grid={self.gsi_settings['grid_size']}"
+        )
+
+        if close_on_success:
+            self.cleanup_gsi_settings_ui()
+        elif self.gsi_settings_error_text is not None:
+            self.gsi_settings_error_text.set_text("")
+            self.fig.canvas.draw_idle()
+
+        return True
 
     def load_scale_settings(self):
         """前回保存した縮尺設定を scale.json から読み込みます。
@@ -832,7 +1055,7 @@ class SimpleCadApp:
 
         return event_ax.bbox.contains(event.x, event.y)
 
-    def next_panel_y(self, y, height=0.038, gap=0.012):
+    def next_panel_y(self, y, height=0.034, gap=0.008):
         """右側パネルの次のボタン位置を返します。"""
 
         return y - height - gap
@@ -849,7 +1072,7 @@ class SimpleCadApp:
             color="#222222",
         )
 
-    def create_panel_button(self, label, y, callback=None, x=0.84, width=0.14, height=0.038):
+    def create_panel_button(self, label, y, callback=None, x=0.84, width=0.14, height=0.034):
         """右側パネル用のボタンを作ります。"""
 
         ax = self.register_ui_axes(self.fig.add_axes([x, y, width, height]))
@@ -920,6 +1143,12 @@ class SimpleCadApp:
             self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
         )
         y = self.next_panel_y(y)
+        self.gsi_settings_button = self.create_panel_button(
+            "取得設定",
+            y,
+            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
+        )
+        y = self.next_panel_y(y)
         self.gsi_tile_button = self.create_panel_button(
             "地理院取得",
             y,
@@ -944,7 +1173,7 @@ class SimpleCadApp:
         )
 
         for index, (key, layer) in enumerate(LAYERS.items()):
-            layer_y = 0.497 - index * 0.05
+            layer_y = 0.492 - index * 0.046
             button = self.create_panel_button(
                 layer["label"],
                 layer_y,
