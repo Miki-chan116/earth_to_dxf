@@ -6,7 +6,6 @@ import os
 import time
 import traceback
 
-import ezdxf
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import cursors
@@ -15,7 +14,10 @@ from PIL import Image
 
 from src.constants import (
     A3_FOCUS_SCALE,
-    BACKGROUND_LAYER,
+    GSI_DEFAULT_LAT,
+    GSI_DEFAULT_LON,
+    GSI_DEFAULT_TILE_TYPE,
+    GSI_DEFAULT_ZOOM,
     CIVIL_STANDARD_SCALES,
     CONFIRMED_LINE_WIDTH,
     CONFIRMED_MARKER_SIZE,
@@ -32,7 +34,6 @@ from src.constants import (
     DEFAULT_IMAGE_FILE,
     LAYERS,
     MARKER_EDGE_WIDTH,
-    OUTPUT_PREFIX,
     PRINT_MARGIN_MM,
     PRINT_PAPER_SIZES_MM,
     PROJECT_FILE,
@@ -56,6 +57,8 @@ from src.project_store import (
     load_project as load_project_file,
     save_project as save_project_file,
 )
+from src.dxf_export import export_dxf
+from src.gsi_tile import fetch_gsi_tile
 from src.scale_utils import (
     image_fits_paper_at_scale as calc_image_fits_paper_at_scale,
     nearest_standard_scale,
@@ -237,6 +240,7 @@ class SimpleCadApp:
         self.redo_button = None
         self.close_button = None
         self.scale_button = None
+        self.gsi_tile_button = None
         self.project_save_button = None
         self.project_load_button = None
         self.info_detail_button = None
@@ -404,9 +408,12 @@ class SimpleCadApp:
     def get_reference_scale_message(self, detailed=False):
         """右側パネルへ表示する座標換算と参考印刷縮尺を作ります。"""
 
-        background_filename = os.path.basename(self.background_image_path)
+        background_filename = self.get_panel_filename(self.background_image_path)
         paper_denominators = {}
-        lines = [f"背景: {background_filename}", f"換算: 1px={self.meters_per_pixel:.4f}m"]
+        lines = [
+            f"背景: {background_filename}",
+            f"換算: 1px={self.meters_per_pixel:.4f}m",
+        ]
 
         if self.scale_needs_reset:
             lines.append("縮尺再設定が必要")
@@ -418,13 +425,14 @@ class SimpleCadApp:
                 paper_height_mm,
             )
             paper_denominators[label] = denominator
+            compact_label = label.replace("横", "")
 
             if denominator is None:
                 scale_text = "計算不可"
             else:
-                scale_text = f"約1/{round(denominator):,}"
+                scale_text = f"1/{round(denominator):,}"
 
-            reference_lines.append(f"{label}: {scale_text}")
+            reference_lines.append(f"{compact_label} {scale_text}")
 
         lines.append("参考: " + " / ".join(reference_lines))
 
@@ -446,29 +454,38 @@ class SimpleCadApp:
                 )
             )
 
-
-        a3_width_mm, a3_height_mm = PRINT_PAPER_SIZES_MM["A3横"]
-        fits_a3_500 = self.image_fits_paper_at_scale(
-            a3_width_mm,
-            a3_height_mm,
-            A3_FOCUS_SCALE,
-        )
-
-        if fits_a3_500:
-            lines.append("A3 1/500: 収まる")
-        else:
-            next_scale = self.get_next_fitting_standard_scale(
+            a3_width_mm, a3_height_mm = PRINT_PAPER_SIZES_MM["A3横"]
+            fits_a3_500 = self.image_fits_paper_at_scale(
                 a3_width_mm,
                 a3_height_mm,
+                A3_FOCUS_SCALE,
             )
-            if next_scale is None:
-                lines.append("A3 1/500: 不可")
-            else:
-                lines.append(f"A3 1/500: 不可 -> 1/{next_scale}")
 
-        lines.append("※印刷・図面作成の目安")
+            if fits_a3_500:
+                lines.append("A3 1/500: 収まる")
+            else:
+                next_scale = self.get_next_fitting_standard_scale(
+                    a3_width_mm,
+                    a3_height_mm,
+                )
+                if next_scale is None:
+                    lines.append("A3 1/500: 不可")
+                else:
+                    lines.append(f"A3 1/500: 不可 -> 1/{next_scale}")
+
+            lines.append("※印刷・図面作成の目安")
 
         return "\n".join(lines)
+
+    def get_panel_filename(self, image_path, max_chars=20):
+        """右側パネル向けに、背景画像をファイル名だけで短く表示します。"""
+
+        filename = os.path.basename(os.path.normpath(image_path))
+        if len(filename) <= max_chars:
+            return filename
+
+        keep_head = max_chars - 11
+        return f"{filename[:keep_head]}...{filename[-8:]}"
 
     def normalize_image_path(self, image_path):
         """config.json の画像パスをアプリ起点の絶対パスへそろえます。"""
@@ -502,6 +519,50 @@ class SimpleCadApp:
 
         if save_config_file(config):
             debug_log("背景画像設定を保存しました: config.json")
+
+    def fetch_default_gsi_tile(self):
+        """コード上部の定数を使って地理院タイルを取得します。"""
+
+        if self.scale_mode:
+            self.cancel_current_line()
+
+        print("")
+        print(
+            "地理院タイル取得開始: "
+            f"lat={GSI_DEFAULT_LAT}, lon={GSI_DEFAULT_LON}, zoom={GSI_DEFAULT_ZOOM}"
+        )
+
+        result = fetch_gsi_tile(
+            GSI_DEFAULT_LAT,
+            GSI_DEFAULT_LON,
+            GSI_DEFAULT_ZOOM,
+            tile_type=GSI_DEFAULT_TILE_TYPE,
+        )
+
+        previous_image = self.image
+        self.background_image_path = self.normalize_image_path(result["image_file"])
+        self.image = Image.open(self.background_image_path)
+        try:
+            previous_image.close()
+        except Exception:
+            pass
+
+        self.meters_per_pixel = result["meters_per_pixel"]
+        self.scale_needs_reset = False
+        self.scale_reset_message = ""
+        self.view_initialized = False
+
+        print(f"地理院タイル取得完了: {result['image_file']}")
+        print(
+            f"tile: z={result['zoom']} x={result['tile_x']} y={result['tile_y']}"
+        )
+        print(f"縮尺を自動設定しました: 1px = {self.meters_per_pixel:.4f}m")
+
+        self.show_temporary_notice(
+            "地理院タイルを取得しました\n"
+            f"1px = {self.meters_per_pixel:.4f}m"
+        )
+        self.redraw(reset_view=True)
 
     def load_scale_settings(self):
         """前回保存した縮尺設定を scale.json から読み込みます。
@@ -771,107 +832,133 @@ class SimpleCadApp:
 
         return event_ax.bbox.contains(event.x, event.y)
 
+    def next_panel_y(self, y, height=0.038, gap=0.012):
+        """右側パネルの次のボタン位置を返します。"""
+
+        return y - height - gap
+
+    def create_panel_title(self, label, y):
+        """右側パネルのセクション見出しを作ります。"""
+
+        return self.fig.text(
+            0.835,
+            y,
+            label,
+            fontsize=11.5,
+            fontweight="bold",
+            color="#222222",
+        )
+
+    def create_panel_button(self, label, y, callback=None, x=0.84, width=0.14, height=0.038):
+        """右側パネル用のボタンを作ります。"""
+
+        ax = self.register_ui_axes(self.fig.add_axes([x, y, width, height]))
+        button = Button(ax, label)
+
+        if callback is not None:
+            button.on_clicked(callback)
+
+        return button
+
+    def create_panel_button_row(self, left_label, right_label, y, left_callback, right_callback):
+        """右側パネル用に横並び2ボタンを作ります。"""
+
+        left_button = self.create_panel_button(
+            left_label,
+            y,
+            left_callback,
+            width=0.066,
+        )
+        right_button = self.create_panel_button(
+            right_label,
+            y,
+            right_callback,
+            x=0.914,
+            width=0.066,
+        )
+
+        return left_button, right_button
+
     def setup_widgets(self):
         """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
 
-        self.operation_title_text = self.fig.text(
-            0.835,
-            0.955,
-            "操作",
-            fontsize=12,
-            fontweight="bold",
-            color="#222222",
-        )
-        self.layer_title_text = self.fig.text(
-            0.835,
-            0.64,
-            "",
-            fontsize=12,
-            fontweight="bold",
-            color="#222222",
-        )
-        self.info_title_text = self.fig.text(
-            0.835,
-            0.345,
-            "情報",
-            fontsize=12,
-            fontweight="bold",
-            color="#222222",
-        )
+        self.operation_title_text = self.create_panel_title("操作", 0.958)
+        self.layer_title_text = self.create_panel_title("", 0.548)
+        self.info_title_text = self.create_panel_title("情報", 0.318)
         self.scale_reference_text = self.fig.text(
             0.835,
-            0.255,
+            0.228,
             "",
-            fontsize=8.5,
+            fontsize=8.0,
             color="#222222",
             va="top",
-            linespacing=1.25,
+            linespacing=1.15,
         )
 
-        save_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.90, 0.14, 0.045]))
-        project_save_ax = self.register_ui_axes(
-            self.fig.add_axes([0.84, 0.845, 0.14, 0.045])
+        y = 0.902
+        self.save_button = self.create_panel_button(
+            "DXF保存",
+            y,
+            self.safe_callback("save_dxf", lambda event: self.save_dxf()),
         )
-        project_load_ax = self.register_ui_axes(
-            self.fig.add_axes([0.84, 0.79, 0.14, 0.045])
+        y = self.next_panel_y(y)
+        self.project_save_button = self.create_panel_button(
+            "作業保存",
+            y,
+            self.safe_callback("save_project", lambda event: self.save_project()),
         )
-        scale_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.735, 0.14, 0.045]))
-        undo_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.68, 0.065, 0.04]))
-        redo_ax = self.register_ui_axes(self.fig.add_axes([0.915, 0.68, 0.065, 0.04]))
-
-        for index, (key, layer) in enumerate(LAYERS.items()):
-            layer_ax = self.register_ui_axes(
-                self.fig.add_axes([0.84, 0.585 - index * 0.055, 0.14, 0.045])
-            )
-            button = Button(layer_ax, layer["label"])
-            button.on_clicked(
-                self.safe_callback(
-                    f"change_layer:{layer['label']}",
-                    lambda event, layer_key=key: self.change_layer(layer_key),
-                )
-            )
-            self.layer_buttons[key] = button
-
-        close_ax = self.register_ui_axes(self.fig.add_axes([0.84, 0.365, 0.14, 0.045]))
-        info_detail_ax = self.register_ui_axes(
-            self.fig.add_axes([0.84, 0.295, 0.14, 0.04])
+        y = self.next_panel_y(y)
+        self.project_load_button = self.create_panel_button(
+            "作業読込",
+            y,
+            self.safe_callback("load_project", lambda event: self.load_project()),
         )
-
-        self.save_button = Button(save_ax, "DXF保存")
-        self.undo_button = Button(undo_ax, "Undo")
-        self.redo_button = Button(redo_ax, "Redo")
-        self.close_button = Button(close_ax, "閉じて確定")
-        self.scale_button = Button(scale_ax, "縮尺設定")
-        self.project_save_button = Button(project_save_ax, "作業保存")
-        self.project_load_button = Button(project_load_ax, "作業読込")
-        self.info_detail_button = Button(info_detail_ax, "詳細表示")
-
-        self.save_button.on_clicked(
-            self.safe_callback("save_dxf", lambda event: self.save_dxf())
+        y = self.next_panel_y(y)
+        self.scale_button = self.create_panel_button(
+            "縮尺設定",
+            y,
+            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
         )
-        self.undo_button.on_clicked(
-            self.safe_callback("undo", lambda event: self.undo())
+        y = self.next_panel_y(y)
+        self.gsi_tile_button = self.create_panel_button(
+            "地理院取得",
+            y,
+            self.safe_callback("fetch_gsi_tile", lambda event: self.fetch_default_gsi_tile()),
         )
-        self.redo_button.on_clicked(
-            self.safe_callback("redo", lambda event: self.redo())
-        )
-        self.close_button.on_clicked(
+        y = self.next_panel_y(y)
+        self.close_button = self.create_panel_button(
+            "閉じて確定",
+            y,
             self.safe_callback(
                 "finish_current_line_closed",
                 lambda event: self.finish_current_line(closed=True),
+            ),
+        )
+        y = self.next_panel_y(y)
+        self.undo_button, self.redo_button = self.create_panel_button_row(
+            "Undo",
+            "Redo",
+            y,
+            self.safe_callback("undo", lambda event: self.undo()),
+            self.safe_callback("redo", lambda event: self.redo()),
+        )
+
+        for index, (key, layer) in enumerate(LAYERS.items()):
+            layer_y = 0.497 - index * 0.05
+            button = self.create_panel_button(
+                layer["label"],
+                layer_y,
+                self.safe_callback(
+                    f"change_layer:{layer['label']}",
+                    lambda event, layer_key=key: self.change_layer(layer_key),
+                ),
             )
-        )
-        self.scale_button.on_clicked(
-            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode())
-        )
-        self.project_save_button.on_clicked(
-            self.safe_callback("save_project", lambda event: self.save_project())
-        )
-        self.project_load_button.on_clicked(
-            self.safe_callback("load_project", lambda event: self.load_project())
-        )
-        self.info_detail_button.on_clicked(
-            self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail())
+            self.layer_buttons[key] = button
+
+        self.info_detail_button = self.create_panel_button(
+            "詳細表示",
+            0.263,
+            self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
         )
         self.update_layer_ui()
 
@@ -1049,9 +1136,9 @@ class SimpleCadApp:
         self.ax.set_aspect("equal", adjustable="box")
 
         self.ax.set_title(
-            "左クリック=点追加/点選択  右クリック=線確定  Space+ドラッグ=移動  "
-            "ホイール=ズーム  Esc=キャンセル  Delete=点削除  クロス中心で作図",
-            fontsize=10,
+            "左クリック=点追加/選択  右クリック=線確定  Space=移動  "
+            "ホイール=ズーム  Esc=キャンセル",
+            fontsize=9.5,
         )
 
         self.draw_confirmed_lines()
@@ -2438,95 +2525,19 @@ class SimpleCadApp:
     # DXF出力
     # --------------------------------------------------------
 
-    def image_point_to_cad_point(self, x, y):
-        """画像座標をCAD座標に変換します。
-
-        matplotlib画像座標は左上が原点で、下方向にyが増えます。
-        CAD座標は一般的に左下を原点として上方向にyが増えるため、
-        y座標を反転してから縮尺を掛けます。
-        """
-
-        cad_x = x * self.meters_per_pixel
-        cad_y = (self.image.height - y) * self.meters_per_pixel
-
-        return cad_x, cad_y
-
-    def add_layers_to_dxf(self, doc):
-        """DXF内に必要なレイヤを作成します。"""
-
-        for layer in LAYERS.values():
-            if layer["name"] not in doc.layers:
-                doc.layers.add(name=layer["name"], color=layer["color"])
-
-        if BACKGROUND_LAYER["name"] not in doc.layers:
-            doc.layers.add(
-                name=BACKGROUND_LAYER["name"],
-                color=BACKGROUND_LAYER["color"],
-            )
-
-    def add_background_image_to_dxf(self, doc, msp):
-        """DXFへ背景画像参照を追加します。
-
-        注意:
-        DXFに画像ファイルそのものを埋め込むのではなく、現在の背景画像への参照を保存します。
-        AutoCAD / TREND-CORE 側で表示するには、DXFと背景画像を同じフォルダに置く運用が安全です。
-        """
-
-        if not os.path.exists(self.background_image_path):
-            print("背景画像が見つからないため、DXF画像参照は追加しません")
-            return
-
-        image_def = doc.add_image_def(
-            filename=self.background_image_path,
-            size_in_pixel=(self.image.width, self.image.height),
-        )
-
-        msp.add_image(
-            image_def,
-            insert=(0, 0),
-            size_in_units=(
-                self.image.width * self.meters_per_pixel,
-                self.image.height * self.meters_per_pixel,
-            ),
-            dxfattribs={"layer": BACKGROUND_LAYER["name"]},
-        )
-
-    def add_lines_to_dxf(self, msp):
-        """確定済みの線・面をDXFに追加します。"""
-
-        for line in self.lines:
-            layer_name = line["layer"]["name"]
-
-            cad_points = [
-                self.image_point_to_cad_point(x, y)
-                for x, y in line["points"]
-            ]
-
-            if len(cad_points) < 2:
-                continue
-
-            msp.add_lwpolyline(
-                cad_points,
-                close=line.get("closed", False),
-                dxfattribs={"layer": layer_name},
-            )
-
     def save_dxf(self):
         """現在の図形をDXFとして保存します。"""
 
         if len(self.current_points) >= 2:
             self.finish_current_line(closed=False)
 
-        doc = ezdxf.new("R2010")
-        doc.units = ezdxf.units.M
-
-        msp = doc.modelspace()
-        self.add_layers_to_dxf(doc)
-        self.add_background_image_to_dxf(doc, msp)
-        self.add_lines_to_dxf(msp)
-
-        filename = f"{OUTPUT_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dxf"
-        doc.saveas(filename)
+        filename = export_dxf(
+            lines=self.lines,
+            background_image_path=self.background_image_path,
+            image_width=self.image.width,
+            image_height=self.image.height,
+            meters_per_pixel=self.meters_per_pixel,
+        )
 
         print("")
         print(f"DXF保存完了: {filename}")

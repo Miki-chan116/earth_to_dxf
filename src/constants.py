@@ -7,6 +7,12 @@ OUTPUT_PREFIX = "output"
 CONFIG_FILE = "config.json"
 SCALE_FILE = "scale.json"
 PROJECT_FILE = "project.json"
+ASSETS_DIR = "assets"
+
+GSI_DEFAULT_LAT = 33.839
+GSI_DEFAULT_LON = 132.765
+GSI_DEFAULT_ZOOM = 18
+GSI_DEFAULT_TILE_TYPE = "std"
 
 PRINT_PAPER_SIZES_MM = {
     "A4横": (297, 210),
@@ -47,4 +53,3 @@ BACKGROUND_LAYER = {
     "label": "背景画像",
     "color": 8,
 }
-
