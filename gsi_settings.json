@@ -3,5 +3,6 @@
   "longitude": 132.765,
   "zoom": 18,
   "grid_size": 3,
-  "updated_at": "2026-05-19T21:54:10"
+  "tile_type": "seamlessphoto",
+  "updated_at": "2026-05-19T22:06:26"
 }

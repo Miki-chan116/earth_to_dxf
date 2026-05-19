@@ -14,10 +14,6 @@ from PIL import Image
 
 from src.constants import (
     A3_FOCUS_SCALE,
-    GSI_DEFAULT_LAT,
-    GSI_DEFAULT_LON,
-    GSI_DEFAULT_TILE_TYPE,
-    GSI_DEFAULT_ZOOM,
     CIVIL_STANDARD_SCALES,
     CONFIRMED_LINE_WIDTH,
     CONFIRMED_MARKER_SIZE,
@@ -60,6 +56,7 @@ from src.project_store import (
 from src.dxf_export import export_dxf
 from src.gsi_tile import (
     fetch_gsi_tile_grid,
+    get_tile_type_label,
     load_gsi_settings,
     save_gsi_settings,
     validate_gsi_settings,
@@ -427,6 +424,7 @@ class SimpleCadApp:
         paper_denominators = {}
         lines = [
             f"背景: {background_filename}",
+            f"地図: {get_tile_type_label(self.gsi_settings['tile_type'])}",
             f"換算: 1px={self.meters_per_pixel:.4f}m",
         ]
 
@@ -549,18 +547,20 @@ class SimpleCadApp:
         lon = self.gsi_settings["longitude"]
         zoom = self.gsi_settings["zoom"]
         grid_size = self.gsi_settings["grid_size"]
+        tile_type = self.gsi_settings["tile_type"]
 
         print("")
         print(
             "地理院タイル取得開始: "
-            f"lat={lat}, lon={lon}, zoom={zoom}, grid={grid_size}x{grid_size}"
+            f"lat={lat}, lon={lon}, zoom={zoom}, "
+            f"grid={grid_size}x{grid_size}, map={tile_type}"
         )
 
         result = fetch_gsi_tile_grid(
             lat,
             lon,
             zoom,
-            tile_type=GSI_DEFAULT_TILE_TYPE,
+            tile_type=tile_type,
             grid_size=grid_size,
         )
 
@@ -637,6 +637,7 @@ class SimpleCadApp:
             ("longitude", "経度", self.gsi_settings["longitude"]),
             ("zoom", "ズーム", self.gsi_settings["zoom"]),
             ("grid_size", "グリッド", self.gsi_settings["grid_size"]),
+            ("tile_type", "地図種別", self.gsi_settings["tile_type"]),
         ]
 
         for index, (key, label, value) in enumerate(fields):
@@ -666,8 +667,8 @@ class SimpleCadApp:
 
         help_text = self.fig.text(
             label_x,
-            start_y - 4 * row_gap + 0.015,
-            "グリッドサイズは 1 / 3 / 5 のみ",
+            start_y - 5 * row_gap + 0.015,
+            "地図種別: std / pale / seamlessphoto\nグリッド: 1 / 3 / 5",
             fontsize=8,
             color="#333333",
             zorder=30,
@@ -676,7 +677,7 @@ class SimpleCadApp:
 
         self.gsi_settings_error_text = self.fig.text(
             label_x,
-            start_y - 4 * row_gap - 0.015,
+            start_y - 5 * row_gap - 0.025,
             "",
             fontsize=8,
             color="#b00020",
@@ -685,7 +686,7 @@ class SimpleCadApp:
 
         ok_button = self.create_panel_button(
             "設定OK",
-            start_y - 4 * row_gap - 0.065,
+            start_y - 5 * row_gap - 0.075,
             self.safe_callback("apply_gsi_settings", lambda event: self.apply_gsi_settings()),
             x=label_x,
             width=0.12,
@@ -693,7 +694,7 @@ class SimpleCadApp:
         )
         cancel_button = self.create_panel_button(
             "閉じる",
-            start_y - 4 * row_gap - 0.065,
+            start_y - 5 * row_gap - 0.075,
             self.safe_callback("close_gsi_settings", lambda event: self.cleanup_gsi_settings_ui()),
             x=label_x + 0.135,
             width=0.12,
@@ -761,6 +762,7 @@ class SimpleCadApp:
                 self.gsi_settings_boxes["longitude"].text,
                 self.gsi_settings_boxes["zoom"].text,
                 self.gsi_settings_boxes["grid_size"].text,
+                self.gsi_settings_boxes["tile_type"].text,
             )
             self.gsi_settings = save_gsi_settings(settings)
         except (KeyError, OSError, ValueError) as error:
@@ -776,7 +778,8 @@ class SimpleCadApp:
             f"lat={self.gsi_settings['latitude']}, "
             f"lon={self.gsi_settings['longitude']}, "
             f"zoom={self.gsi_settings['zoom']}, "
-            f"grid={self.gsi_settings['grid_size']}"
+            f"grid={self.gsi_settings['grid_size']}, "
+            f"map={self.gsi_settings['tile_type']}"
         )
 
         if close_on_success:

@@ -14,6 +14,7 @@ from src.constants import (
     ASSETS_DIR,
     GSI_DEFAULT_LAT,
     GSI_DEFAULT_LON,
+    GSI_DEFAULT_TILE_TYPE,
     GSI_DEFAULT_ZOOM,
     GSI_SETTINGS_FILE,
     SCALE_FILE,
@@ -27,6 +28,14 @@ CA_CERTIFICATE_PATHS = (
     "/usr/local/etc/openssl@3/cert.pem",
 )
 ALLOWED_GRID_SIZES = {1, 3, 5}
+GSI_TILE_TYPES = {
+    "std": {"label": "標準地図", "extension": "png"},
+    "pale": {"label": "淡色地図", "extension": "png"},
+    "seamlessphoto": {"label": "空中写真", "extension": "jpg"},
+}
+GSI_TILE_TYPE_LABELS = {
+    tile["label"]: tile_type for tile_type, tile in GSI_TILE_TYPES.items()
+}
 
 
 def default_gsi_settings():
@@ -37,10 +46,37 @@ def default_gsi_settings():
         "longitude": GSI_DEFAULT_LON,
         "zoom": GSI_DEFAULT_ZOOM,
         "grid_size": 3,
+        "tile_type": GSI_DEFAULT_TILE_TYPE,
     }
 
 
-def validate_gsi_settings(lat, lon, zoom, grid_size):
+def normalize_tile_type(tile_type):
+    """Normalize a tile type code or display label."""
+
+    value = str(tile_type).strip()
+    if value in GSI_TILE_TYPES:
+        return value
+    if value in GSI_TILE_TYPE_LABELS:
+        return GSI_TILE_TYPE_LABELS[value]
+
+    raise ValueError("地図種別は std / pale / seamlessphoto のいずれかです")
+
+
+def get_tile_type_label(tile_type):
+    """Return the display label for a tile type."""
+
+    normalized = normalize_tile_type(tile_type)
+    return GSI_TILE_TYPES[normalized]["label"]
+
+
+def get_tile_extension(tile_type):
+    """Return the file extension for a tile type."""
+
+    normalized = normalize_tile_type(tile_type)
+    return GSI_TILE_TYPES[normalized]["extension"]
+
+
+def validate_gsi_settings(lat, lon, zoom, grid_size, tile_type=GSI_DEFAULT_TILE_TYPE):
     """Validate and normalize GSI tile fetch settings."""
 
     try:
@@ -78,11 +114,14 @@ def validate_gsi_settings(lat, lon, zoom, grid_size):
     if grid_size_int not in ALLOWED_GRID_SIZES:
         raise ValueError("グリッドサイズは 1 / 3 / 5 のいずれかです")
 
+    normalized_tile_type = normalize_tile_type(tile_type)
+
     return {
         "latitude": latitude,
         "longitude": longitude,
         "zoom": zoom_int,
         "grid_size": grid_size_int,
+        "tile_type": normalized_tile_type,
     }
 
 
@@ -110,6 +149,7 @@ def load_gsi_settings(path=GSI_SETTINGS_FILE):
             data.get("longitude", settings["longitude"]),
             data.get("zoom", settings["zoom"]),
             data.get("grid_size", settings["grid_size"]),
+            data.get("tile_type", settings["tile_type"]),
         )
     except ValueError as error:
         print(f"{path} の設定が不正です: {error}")
@@ -124,6 +164,7 @@ def save_gsi_settings(settings, path=GSI_SETTINGS_FILE):
         settings.get("longitude"),
         settings.get("zoom"),
         settings.get("grid_size"),
+        settings.get("tile_type", GSI_DEFAULT_TILE_TYPE),
     )
     data = dict(normalized)
     data["updated_at"] = datetime.now().isoformat(timespec="seconds")
@@ -158,7 +199,9 @@ def latlon_to_tile(lat, lon, zoom):
 def tile_to_url(tile_type, z, x, y):
     """Build the GSI tile URL."""
 
-    return f"{GSI_TILE_BASE_URL}/{tile_type}/{z}/{x}/{y}.png"
+    normalized = normalize_tile_type(tile_type)
+    extension = get_tile_extension(normalized)
+    return f"{GSI_TILE_BASE_URL}/{normalized}/{z}/{x}/{y}.{extension}"
 
 
 def download_tile(url, output_path):
@@ -201,18 +244,29 @@ def calculate_meters_per_pixel(lat, zoom):
     return 156543.03392 * math.cos(math.radians(float(lat))) / (2 ** int(zoom))
 
 
-def build_tile_output_path(z, x, y, assets_dir=ASSETS_DIR):
+def build_tile_output_path(z, x, y, tile_type="std", assets_dir=ASSETS_DIR):
     """Build the local tile output path."""
 
-    return os.path.join(assets_dir, f"gsi_tile_z{z}_x{x}_y{y}.png")
+    normalized = normalize_tile_type(tile_type)
+    extension = get_tile_extension(normalized)
+    return os.path.join(assets_dir, f"gsi_{normalized}_z{z}_x{x}_y{y}.{extension}")
 
 
-def build_tile_grid_output_path(z, center_x, center_y, grid_size, assets_dir=ASSETS_DIR):
+def build_tile_grid_output_path(
+    z,
+    center_x,
+    center_y,
+    grid_size,
+    tile_type="std",
+    assets_dir=ASSETS_DIR,
+):
     """Build the local merged tile grid output path."""
 
+    normalized = normalize_tile_type(tile_type)
+    extension = get_tile_extension(normalized)
     return os.path.join(
         assets_dir,
-        f"gsi_tiles_z{z}_x{center_x}_y{center_y}_{grid_size}x{grid_size}.png",
+        f"gsi_{normalized}_z{z}_x{center_x}_y{center_y}_{grid_size}x{grid_size}.{extension}",
     )
 
 
@@ -283,6 +337,7 @@ def build_scale_data(
     zoom,
     tile_x,
     tile_y,
+    tile_type,
 ):
     """Build scale.json data for a fetched GSI tile."""
 
@@ -294,6 +349,7 @@ def build_scale_data(
         "latitude": lat,
         "longitude": lon,
         "zoom": zoom,
+        "tile_type": normalize_tile_type(tile_type),
         "tile_x": tile_x,
         "tile_y": tile_y,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -309,6 +365,7 @@ def build_grid_scale_data(
     center_tile_x,
     center_tile_y,
     grid_size,
+    tile_type,
 ):
     """Build scale.json data for a fetched GSI tile grid."""
 
@@ -320,6 +377,7 @@ def build_grid_scale_data(
         "latitude": lat,
         "longitude": lon,
         "zoom": zoom,
+        "tile_type": normalize_tile_type(tile_type),
         "center_tile_x": center_tile_x,
         "center_tile_y": center_tile_y,
         "grid_size": grid_size,
@@ -338,9 +396,10 @@ def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
     """Fetch one GSI center tile and update config.json and scale.json."""
 
     zoom = int(zoom)
+    tile_type = normalize_tile_type(tile_type)
     tile_x, tile_y = latlon_to_tile(lat, lon, zoom)
     url = tile_to_url(tile_type, zoom, tile_x, tile_y)
-    output_path = build_tile_output_path(zoom, tile_x, tile_y)
+    output_path = build_tile_output_path(zoom, tile_x, tile_y, tile_type=tile_type)
     download_tile(url, output_path)
 
     meters_per_pixel = calculate_meters_per_pixel(lat, zoom)
@@ -352,6 +411,7 @@ def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
         zoom=zoom,
         tile_x=tile_x,
         tile_y=tile_y,
+        tile_type=tile_type,
     )
 
     save_config({"background_image": get_storable_image_path(output_path)})
@@ -364,6 +424,7 @@ def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
         "latitude": lat,
         "longitude": lon,
         "zoom": zoom,
+        "tile_type": tile_type,
         "tile_x": tile_x,
         "tile_y": tile_y,
         "scale_data": scale_data,
@@ -374,13 +435,19 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
     """Fetch a GSI tile grid, merge it, and update config.json and scale.json."""
 
     zoom = int(zoom)
+    tile_type = normalize_tile_type(tile_type)
     center_tile_x, center_tile_y = latlon_to_tile(lat, lon, zoom)
     tiles = get_tile_grid(center_tile_x, center_tile_y, zoom, grid_size=grid_size)
     downloaded_tiles = []
 
     for tile in tiles:
         url = tile_to_url(tile_type, zoom, tile["x"], tile["y"])
-        tile_path = build_tile_output_path(zoom, tile["x"], tile["y"])
+        tile_path = build_tile_output_path(
+            zoom,
+            tile["x"],
+            tile["y"],
+            tile_type=tile_type,
+        )
         download_tile(url, tile_path)
         downloaded_tiles.append(
             {
@@ -398,6 +465,7 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
         center_tile_x,
         center_tile_y,
         grid_size,
+        tile_type=tile_type,
     )
     merge_tiles(downloaded_tiles, output_path, grid_size=grid_size)
 
@@ -411,6 +479,7 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
         center_tile_x=center_tile_x,
         center_tile_y=center_tile_y,
         grid_size=grid_size,
+        tile_type=tile_type,
     )
 
     save_config({"background_image": get_storable_image_path(output_path)})
@@ -422,6 +491,7 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
         "latitude": lat,
         "longitude": lon,
         "zoom": zoom,
+        "tile_type": tile_type,
         "center_tile_x": center_tile_x,
         "center_tile_y": center_tile_y,
         "grid_size": grid_size,
