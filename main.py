@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import math
 import os
+import subprocess
 import time
 import traceback
 
@@ -187,8 +188,11 @@ class SimpleCadApp:
         self.notice_expires_at = None
         self.action_message = ""
         self.action_timer = None
+        self.clear_confirm_pending = False
+        self.clear_confirm_timer = None
         self.info_detail_expanded = False
         self.gsi_settings = load_gsi_settings()
+        self.prefer_startup_line_map()
         self.gsi_settings_visible = False
         self.gsi_settings_texts = []
         self.gsi_settings_axes = []
@@ -248,7 +252,7 @@ class SimpleCadApp:
 
         self.fig, self.image_ax = plt.subplots(figsize=(12, 9))
         self.ax = self.image_ax
-        self.fig.subplots_adjust(right=0.80, bottom=0.12)
+        self.fig.subplots_adjust(right=0.76, bottom=0.12)
 
         self.status_text = self.fig.text(
             0.02,
@@ -263,6 +267,7 @@ class SimpleCadApp:
         self.info_title_text = None
         self.scale_reference_text = None
         self.measurement_text = None
+        self.panel_status_text = None
         self.layer_buttons = {}
         self.ui_axes_set = set()
         self.save_button = None
@@ -272,6 +277,9 @@ class SimpleCadApp:
         self.scale_button = None
         self.gsi_settings_button = None
         self.gsi_tile_button = None
+        self.map_type_buttons = {}
+        self.clear_button = None
+        self.address_search_from_settings_button = None
         self.project_save_button = None
         self.project_load_button = None
         self.info_detail_button = None
@@ -279,6 +287,7 @@ class SimpleCadApp:
         self.view_initialized = False
 
         self.setup_widgets()
+        self.ensure_startup_background_map()
         self.connect_events()
         self.print_help()
         self.load_project(auto=True, show_notice=False, redraw=False)
@@ -292,6 +301,50 @@ class SimpleCadApp:
         """現在選択されているレイヤ設定を返します。"""
 
         return LAYERS[self.current_layer_key]
+
+    def prefer_startup_line_map(self):
+        """Prefer line-based maps over aerial photos at startup."""
+
+        tile_type = self.gsi_settings.get("tile_type")
+        if tile_type != "seamlessphoto":
+            return
+
+        self.gsi_settings["tile_type"] = "pale"
+        try:
+            self.gsi_settings = save_gsi_settings(self.gsi_settings)
+        except OSError:
+            pass
+
+    def ensure_startup_background_map(self):
+        """Swap aerial-photo startup backgrounds to the preferred line map."""
+
+        if self.gsi_settings.get("tile_type") != "pale":
+            return
+
+        background_name = os.path.basename(self.background_image_path)
+        if "gsi_seamlessphoto_" not in background_name:
+            return
+
+        try:
+            result = fetch_gsi_tile_grid(
+                self.gsi_settings["latitude"],
+                self.gsi_settings["longitude"],
+                self.gsi_settings["zoom"],
+                tile_type=self.gsi_settings["tile_type"],
+                grid_size=self.gsi_settings["grid_size"],
+            )
+        except Exception as error:
+            print(f"起動時の淡色地図切替に失敗しました: {error}")
+            return
+
+        previous_image = self.image
+        self.background_image_path = self.normalize_image_path(result["image_file"])
+        self.image = Image.open(self.background_image_path)
+        self.meters_per_pixel = result["meters_per_pixel"]
+        try:
+            previous_image.close()
+        except Exception:
+            pass
 
     def get_status_message(self):
         """画面下に出すステータス文字列を作ります。"""
@@ -406,6 +459,23 @@ class SimpleCadApp:
             return "距離:\n-\n面積:\n-"
 
         return "\n".join(lines)
+
+    def get_panel_status_message(self):
+        """Return the message shown in the right-side status area."""
+
+        self.expire_temporary_notice_if_needed(redraw=False)
+
+        if self.notice_message:
+            return self.notice_message
+
+        if self.action_message:
+            return self.action_message
+
+        address = self.gsi_settings.get("address", "").strip()
+        if address:
+            return f"住所: {address}"
+
+        return "住所検索は macOS 入力ダイアログ、または gsi_settings.json の address を使えます"
 
     def get_mouse_position_message(self):
         """ステータスバー用に現在マウス位置を画像pxとCAD mで返します。"""
@@ -708,143 +778,45 @@ class SimpleCadApp:
         )
         self.redraw(reset_view=True)
 
-    def toggle_address_search_ui(self):
-        """住所検索フォームを開閉します。"""
+    def change_map_type(self, tile_type):
+        """Switch map type and refetch the current GSI tiles."""
 
-        if self.address_search_visible:
-            self.cleanup_address_search_ui()
-        else:
-            self.show_address_search_ui()
+        try:
+            settings = dict(self.gsi_settings)
+            settings["tile_type"] = tile_type
+            self.gsi_settings = save_gsi_settings(settings)
+        except (OSError, ValueError) as error:
+            print(f"地図種別変更エラー: {error}")
+            self.show_temporary_notice(str(error), duration_ms=2800)
+            return False
+
+        self.update_layer_ui()
+        self.fetch_default_gsi_tile()
+        return True
+
+    def toggle_address_search_ui(self):
+        """macOSネイティブ入力か設定ファイル住所で住所検索します。"""
+
+        self.cleanup_gsi_settings_ui()
+
+        address = self.prompt_address_input()
+        if address is None:
+            self.show_temporary_notice("住所入力をキャンセルしました", duration_ms=1800)
+            return
+
+        if not address.strip():
+            self.show_temporary_notice("住所が空のため検索しませんでした", duration_ms=2200)
+            return
+
+        self.run_address_search(address)
 
     def show_address_search_ui(self):
-        """matplotlib画面内に住所入力欄を表示します。"""
+        """Compatibility wrapper for older callbacks."""
 
-        self.cleanup_address_search_ui()
-        self.cleanup_gsi_settings_ui()
-        self.address_search_visible = True
-
-        title = self.fig.text(
-            0.11,
-            0.875,
-            "住所検索",
-            fontsize=12,
-            fontweight="bold",
-            color="#222222",
-            bbox={
-                "boxstyle": "round,pad=0.35",
-                "facecolor": "#ffffff",
-                "edgecolor": "#666666",
-                "alpha": 0.94,
-            },
-            zorder=30,
-        )
-        self.address_search_texts.append(title)
-
-        current_address = self.gsi_settings.get("address", "")
-        label = self.fig.text(
-            0.12,
-            0.805,
-            "住所",
-            fontsize=9,
-            color="#222222",
-            zorder=30,
-        )
-        self.address_search_texts.append(label)
-
-        input_ax = self.register_ui_axes(self.fig.add_axes([0.17, 0.792, 0.27, 0.04]))
-        self.address_search_box = TextBox(
-            input_ax,
-            "",
-            initial=current_address,
-            color="#ffffff",
-            hovercolor="#eef5ff",
-        )
-        self.address_search_axes.append(input_ax)
-
-        help_text = self.fig.text(
-            0.12,
-            0.755,
-            "例: 東京都千代田区霞が関1-3-1",
-            fontsize=8,
-            color="#333333",
-            zorder=30,
-        )
-        self.address_search_texts.append(help_text)
-
-        self.address_search_error_text = self.fig.text(
-            0.12,
-            0.725,
-            "",
-            fontsize=8,
-            color="#b00020",
-            zorder=30,
-        )
-
-        self.address_search_ok_button = self.create_panel_button(
-            "検索",
-            0.672,
-            self.safe_callback("apply_address_search", lambda event: self.apply_address_search()),
-            x=0.12,
-            width=0.12,
-            height=0.035,
-        )
-        self.address_search_cancel_button = self.create_panel_button(
-            "閉じる",
-            0.672,
-            self.safe_callback(
-                "close_address_search",
-                lambda event: self.cleanup_address_search_ui(),
-            ),
-            x=0.255,
-            width=0.12,
-            height=0.035,
-        )
-
-        self.address_search_box.on_submit(lambda text: self.apply_address_search())
-        self.fig.canvas.draw_idle()
+        self.toggle_address_search_ui()
 
     def cleanup_address_search_ui(self):
-        """住所検索フォームを閉じます。"""
-
-        if self.address_search_box is not None:
-            try:
-                self.address_search_box.disconnect_events()
-            except Exception:
-                pass
-
-        for ax in self.address_search_axes:
-            self.unregister_ui_axes(ax)
-            try:
-                ax.remove()
-            except ValueError:
-                pass
-
-        for button in (
-            self.address_search_ok_button,
-            self.address_search_cancel_button,
-        ):
-            if button is not None:
-                self.unregister_ui_axes(button.ax)
-                try:
-                    button.disconnect_events()
-                except Exception:
-                    pass
-                try:
-                    button.ax.remove()
-                except ValueError:
-                    pass
-
-        for text in self.address_search_texts:
-            try:
-                text.remove()
-            except ValueError:
-                pass
-
-        if self.address_search_error_text is not None:
-            try:
-                self.address_search_error_text.remove()
-            except ValueError:
-                pass
+        """Clear legacy address-search widget state."""
 
         self.address_search_visible = False
         self.address_search_texts = []
@@ -853,30 +825,70 @@ class SimpleCadApp:
         self.address_search_ok_button = None
         self.address_search_cancel_button = None
         self.address_search_error_text = None
-        self.fig.canvas.draw_idle()
 
     def set_address_search_error(self, message):
-        """住所検索フォームへエラーを表示します。"""
+        """住所検索エラーを右側パネルへ表示します。"""
 
-        if self.address_search_error_text is not None:
-            self.address_search_error_text.set_text(message)
-            self.fig.canvas.draw_idle()
-        else:
-            self.show_temporary_notice(message)
+        self.show_temporary_notice(message, duration_ms=3200)
 
-    def apply_address_search(self):
-        """入力住所を緯度経度に変換し、地理院タイルを取得します。"""
+    def prompt_address_input(self):
+        """Prompt for an address using a native macOS dialog when available."""
 
-        if self.address_search_box is None:
+        current_address = self.gsi_settings.get("address", "")
+        script = (
+            'tell application "System Events"\n'
+            'activate\n'
+            'try\n'
+            f'set response to display dialog "住所を入力してください" default answer "{current_address.replace(chr(34), chr(39))}" buttons {{"取消","検索"}} default button "検索"\n'
+            'return text returned of response\n'
+            'on error number -128\n'
+            'return "__CANCELLED__"\n'
+            'end try\n'
+            'end tell'
+        )
+
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            print(f"住所入力ダイアログを開けませんでした: {error}")
+            return self.gsi_settings.get("address", "")
+
+        output = result.stdout.strip()
+        if output == "__CANCELLED__":
+            return None
+
+        if result.returncode != 0:
+            print(f"住所入力ダイアログエラー: {result.stderr.strip()}")
+            return self.gsi_settings.get("address", "")
+
+        return output
+
+    def search_address_from_settings(self):
+        """Run address search using the address saved in gsi_settings.json."""
+
+        address = str(self.gsi_settings.get("address", "")).strip()
+        if not address:
+            self.show_temporary_notice(
+                "gsi_settings.json の address を先に設定してください",
+                duration_ms=3200,
+            )
             return False
+        return self.run_address_search(address)
 
-        address = self.address_search_box.text.strip()
+    def run_address_search(self, address):
+        """Geocode the address, save settings, and fetch the map."""
+
+        address = str(address).strip()
         if not address:
             self.set_address_search_error("住所を入力してください")
             return False
 
-        self.set_address_search_error("検索中...")
-        self.fig.canvas.draw_idle()
+        self.show_temporary_notice("住所検索中...", duration_ms=1800)
 
         try:
             geocode_result = geocode_address(address)
@@ -898,9 +910,14 @@ class SimpleCadApp:
             f"lon={self.gsi_settings['longitude']}"
         )
 
-        self.cleanup_address_search_ui()
+        self.show_temporary_notice("住所検索に成功しました", duration_ms=2200)
         self.fetch_default_gsi_tile()
         return True
+
+    def apply_address_search(self):
+        """Compatibility wrapper for older callbacks."""
+
+        return self.search_address_from_settings()
 
     def toggle_gsi_settings_ui(self):
         """地理院タイル取得設定の入力欄を開閉します。"""
@@ -1419,12 +1436,21 @@ class SimpleCadApp:
     def setup_widgets(self):
         """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
 
-        self.operation_title_text = self.create_panel_title("操作", 0.958)
-        self.layer_title_text = self.create_panel_title("", 0.548)
-        self.info_title_text = self.create_panel_title("情報", 0.318)
+        self.panel_status_text = self.fig.text(
+            0.835,
+            0.985,
+            "",
+            fontsize=8.5,
+            color="#222222",
+            va="top",
+            linespacing=1.18,
+        )
+        self.operation_title_text = self.create_panel_title("地図と操作", 0.925)
+        self.layer_title_text = self.create_panel_title("", 0.49)
+        self.info_title_text = self.create_panel_title("情報", 0.275)
         self.scale_reference_text = self.fig.text(
             0.835,
-            0.228,
+            0.195,
             "",
             fontsize=8.0,
             color="#222222",
@@ -1433,7 +1459,7 @@ class SimpleCadApp:
         )
         self.measurement_text = self.fig.text(
             0.835,
-            0.148,
+            0.105,
             "",
             fontsize=8.2,
             color="#222222",
@@ -1441,7 +1467,25 @@ class SimpleCadApp:
             linespacing=1.18,
         )
 
-        y = 0.902
+        y = 0.865
+        for tile_type, label in (
+            ("std", "標準地図"),
+            ("pale", "淡色地図"),
+            ("seamlessphoto", "空中写真"),
+        ):
+            button = self.create_panel_button(
+                label,
+                y,
+                self.safe_callback(
+                    f"change_map_type:{tile_type}",
+                    lambda event, selected_tile_type=tile_type: self.change_map_type(
+                        selected_tile_type
+                    ),
+                ),
+            )
+            self.map_type_buttons[tile_type] = button
+            y = self.next_panel_y(y)
+
         self.save_button = self.create_panel_button(
             "DXF保存",
             y,
@@ -1478,6 +1522,15 @@ class SimpleCadApp:
             self.safe_callback("toggle_address_search", lambda event: self.toggle_address_search_ui()),
         )
         y = self.next_panel_y(y)
+        self.address_search_from_settings_button = self.create_panel_button(
+            "設定住所で検索",
+            y,
+            self.safe_callback(
+                "search_address_from_settings",
+                lambda event: self.search_address_from_settings(),
+            ),
+        )
+        y = self.next_panel_y(y)
         self.gsi_tile_button = self.create_panel_button(
             "地理院取得",
             y,
@@ -1493,6 +1546,12 @@ class SimpleCadApp:
             ),
         )
         y = self.next_panel_y(y)
+        self.clear_button = self.create_panel_button(
+            "作図クリア",
+            y,
+            self.safe_callback("clear_drawings", lambda event: self.request_clear_drawings()),
+        )
+        y = self.next_panel_y(y)
         self.undo_button, self.redo_button = self.create_panel_button_row(
             "Undo",
             "Redo",
@@ -1502,7 +1561,7 @@ class SimpleCadApp:
         )
 
         for index, (key, layer) in enumerate(LAYERS.items()):
-            layer_y = 0.492 - index * 0.046
+            layer_y = 0.434 - index * 0.046
             button = self.create_panel_button(
                 layer["label"],
                 layer_y,
@@ -1515,7 +1574,7 @@ class SimpleCadApp:
 
         self.info_detail_button = self.create_panel_button(
             "詳細表示",
-            0.263,
+            0.22,
             self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
         )
         self.update_layer_ui()
@@ -1536,6 +1595,9 @@ class SimpleCadApp:
     def update_layer_ui(self):
         """右側パネルで現在レイヤが一目で分かるように表示します。"""
 
+        if self.panel_status_text is not None:
+            self.panel_status_text.set_text(self.get_panel_status_message())
+
         if self.layer_title_text is not None:
             self.layer_title_text.set_text(
                 f"レイヤ: {self.current_layer()['label']}"
@@ -1552,6 +1614,22 @@ class SimpleCadApp:
             self.info_detail_button.label.set_text(
                 "詳細を隠す" if self.info_detail_expanded else "詳細表示"
             )
+
+        if self.clear_button is not None:
+            self.clear_button.label.set_text(
+                "本当に消す" if self.clear_confirm_pending else "作図クリア"
+            )
+
+        for tile_type, button in self.map_type_buttons.items():
+            is_current = tile_type == self.gsi_settings.get("tile_type")
+            button.ax.set_facecolor("#e7f1dd" if is_current else "#f4f4f4")
+            button.color = "#e7f1dd" if is_current else "#f4f4f4"
+            button.hovercolor = "#d9ebc7" if is_current else "#e8e8e8"
+            button.label.set_fontweight("bold" if is_current else "normal")
+            button.label.set_color("#245b13" if is_current else "#222222")
+            for spine in button.ax.spines.values():
+                spine.set_edgecolor("#4e8b28" if is_current else "#bdbdbd")
+                spine.set_linewidth(1.8 if is_current else 0.8)
 
         for key, button in self.layer_buttons.items():
             is_current = key == self.current_layer_key
@@ -1936,7 +2014,7 @@ class SimpleCadApp:
         self.fig.canvas.draw_idle()
 
     def show_temporary_notice(self, message, duration_ms=3000):
-        """操作完了などの一時メッセージを画面上に表示します。"""
+        """操作完了などの一時メッセージを右側パネルへ表示します。"""
 
         self.notice_message = message
         self.notice_expires_at = time.monotonic() + duration_ms / 1000
@@ -1951,7 +2029,8 @@ class SimpleCadApp:
         self.notice_timer.single_shot = True
         self.notice_timer.add_callback(self.clear_temporary_notice)
         self.notice_timer.start()
-        self.redraw()
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
 
     def clear_temporary_notice(self):
         """一時メッセージを消します。"""
@@ -1959,7 +2038,8 @@ class SimpleCadApp:
         self.notice_message = ""
         self.notice_timer = None
         self.notice_expires_at = None
-        self.redraw()
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
         return False
 
     def is_notice_active(self):
@@ -1985,7 +2065,7 @@ class SimpleCadApp:
             self.redraw()
 
     def show_action_message(self, message, duration_ms=1200):
-        """点追加などの短い操作フィードバックを表示します。"""
+        """点追加などの短い操作フィードバックを右側パネルへ表示します。"""
 
         self.action_message = message
 
@@ -1999,13 +2079,16 @@ class SimpleCadApp:
         self.action_timer.single_shot = True
         self.action_timer.add_callback(self.clear_action_message)
         self.action_timer.start()
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
 
     def clear_action_message(self):
         """短い操作フィードバックを消します。"""
 
         self.action_message = ""
         self.action_timer = None
-        self.redraw()
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
         return False
 
     def stop_scale_dialog_timer(self):
@@ -2233,29 +2316,6 @@ class SimpleCadApp:
                 zorder=21,
             )
 
-        if self.notice_message:
-            self.ax.text(
-                0.5,
-                0.93,
-                self.notice_message,
-                transform=self.ax.transAxes,
-                ha="center",
-                va="top",
-                fontsize=17,
-                fontweight="bold",
-                linespacing=1.35,
-                color="#ffffff",
-                bbox={
-                    "boxstyle": "round,pad=0.5",
-                    "facecolor": "#167a3a",
-                    "edgecolor": "#ffffff",
-                    "linewidth": 1.5,
-                    "alpha": 0.86,
-                },
-                picker=False,
-                zorder=22,
-            )
-
         selected_line = self.get_selected_line()
         if selected_line is not None:
             measurement_lines = [f"延長: {selected_line.get('length_m', 0.0):.2f} m"]
@@ -2281,28 +2341,6 @@ class SimpleCadApp:
                 },
                 picker=False,
                 zorder=24,
-            )
-
-        if self.action_message:
-            self.ax.text(
-                0.015,
-                0.82,
-                self.action_message,
-                transform=self.ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=13,
-                fontweight="bold",
-                color="#ffffff",
-                bbox={
-                    "boxstyle": "round,pad=0.35",
-                    "facecolor": "#d62728",
-                    "edgecolor": "#ffffff",
-                    "linewidth": 1.2,
-                    "alpha": 0.86,
-                },
-                picker=False,
-                zorder=23,
             )
 
     def draw_status_bar(self):
@@ -2415,6 +2453,54 @@ class SimpleCadApp:
         self.undo_stack.append(self.make_snapshot())
         self.restore_snapshot(self.redo_stack.pop())
         print("Redoしました")
+        self.redraw()
+
+    def request_clear_drawings(self):
+        """Ask for confirmation, then clear only drawing geometry."""
+
+        if self.clear_confirm_pending:
+            self.clear_all_drawings()
+            return
+
+        self.clear_confirm_pending = True
+        if self.clear_confirm_timer is not None:
+            try:
+                self.clear_confirm_timer.stop()
+            except Exception:
+                pass
+
+        self.clear_confirm_timer = self.fig.canvas.new_timer(interval=2500)
+        self.clear_confirm_timer.single_shot = True
+        self.clear_confirm_timer.add_callback(self.cancel_clear_confirmation)
+        self.clear_confirm_timer.start()
+        self.show_temporary_notice("もう一度押すと作図だけ消去します", duration_ms=2200)
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
+
+    def cancel_clear_confirmation(self):
+        """Reset the clear confirmation state."""
+
+        self.clear_confirm_pending = False
+        self.clear_confirm_timer = None
+        self.update_layer_ui()
+        self.fig.canvas.draw_idle()
+        return False
+
+    def clear_all_drawings(self):
+        """Clear current and confirmed drawing geometry only."""
+
+        if not self.current_points and not self.lines and self.selected_point is None:
+            self.cancel_clear_confirmation()
+            self.show_temporary_notice("消去する作図がありません", duration_ms=1800)
+            return
+
+        self.push_undo()
+        self.current_points = []
+        self.lines = []
+        self.selected_point = None
+        self.interaction_mode = "idle"
+        self.cancel_clear_confirmation()
+        self.show_temporary_notice("作図をクリアしました", duration_ms=2200)
         self.redraw()
 
     # --------------------------------------------------------
