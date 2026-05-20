@@ -1,7 +1,7 @@
 {
-  "background_image": "assets/gsi_pale_z18_x227943_y104683_3x3.png",
-  "meters_per_pixel": 0.2505244546652514,
-  "current_layer": "1",
+  "background_image": "/Users/miki/Desktop/earth_to_dxf_outputs/assets/gsi_std_z18_x227749_y104857_3x3.png",
+  "meters_per_pixel": 0.49599472346169465,
+  "current_layer": "2",
   "lines": [],
   "current_points": [],
   "layers": {
@@ -31,5 +31,5 @@
     }
   },
   "created_at": "2026-05-18T20:45:47",
-  "updated_at": "2026-05-20T19:39:34"
+  "updated_at": "2026-05-20T21:23:15"
 }

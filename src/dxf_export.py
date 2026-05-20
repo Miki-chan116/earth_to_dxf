@@ -40,7 +40,8 @@ def create_layers(doc, layers=LAYERS, background_layer=BACKGROUND_LAYER):
 def add_background_image(
     doc,
     msp,
-    background_image_path,
+    background_image_source_path,
+    background_image_reference_path,
     image_width,
     image_height,
     meters_per_pixel,
@@ -48,12 +49,12 @@ def add_background_image(
 ):
     """Add the background image as an external IMAGEDEF reference."""
 
-    if not os.path.exists(background_image_path):
+    if not os.path.exists(background_image_source_path):
         print("背景画像が見つからないため、DXF画像参照は追加しません")
         return
 
     image_def = doc.add_image_def(
-        filename=background_image_path,
+        filename=background_image_reference_path,
         size_in_pixel=(image_width, image_height),
     )
 
@@ -100,6 +101,8 @@ def export_dxf(
     image_width,
     image_height,
     meters_per_pixel,
+    output_dir=".",
+    background_image_reference_path=None,
 ):
     """Export the current drawing to a DXF file and return the filename."""
 
@@ -112,13 +115,15 @@ def export_dxf(
         doc,
         msp,
         background_image_path,
+        background_image_reference_path or background_image_path,
         image_width,
         image_height,
         meters_per_pixel,
     )
     add_lines(msp, lines, image_height, meters_per_pixel)
 
-    filename = build_output_filename()
+    os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.join(output_dir, build_output_filename())
     doc.saveas(filename)
 
     return filename

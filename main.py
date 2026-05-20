@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import math
 import os
+import shutil
 import subprocess
 import time
 import traceback
@@ -55,6 +56,7 @@ from src.project_store import (
     save_project as save_project_file,
 )
 from src.dxf_export import export_dxf
+from src.output_settings import load_output_settings, save_output_settings
 from src.geometry_utils import (
     calculate_distance_m,
     calculate_polygon_area_m2,
@@ -197,6 +199,8 @@ class SimpleCadApp:
         self.center_pick_mode = False
         self.gsi_settings = load_gsi_settings()
         self.prefer_startup_line_map()
+        self.output_settings = load_output_settings()
+        self.output_dir = self.output_settings["output_dir"]
         self.last_address_query = str(self.gsi_settings.get("address", "")).strip()
         self.last_geocode_result = None
         self.last_tile_fetch_result = None
@@ -211,6 +215,7 @@ class SimpleCadApp:
         self.gsi_settings_cancel_button = None
         self.gsi_settings_error_text = None
         self.gsi_settings_button = None
+        self.output_dir_button = None
         self.address_search_visible = False
         self.address_search_texts = []
         self.address_search_axes = []
@@ -263,7 +268,7 @@ class SimpleCadApp:
 
         self.fig, self.image_ax = plt.subplots(figsize=(12, 9))
         self.ax = self.image_ax
-        self.fig.subplots_adjust(right=0.80, bottom=0.12, top=0.80)
+        self.fig.subplots_adjust(right=0.80, bottom=0.12, top=0.76)
 
         self.status_text = self.fig.text(
             0.02,
@@ -346,6 +351,7 @@ class SimpleCadApp:
                 self.gsi_settings["zoom"],
                 tile_type=self.gsi_settings["tile_type"],
                 grid_size=self.gsi_settings["grid_size"],
+                assets_dir=self.get_output_assets_dir(),
             )
         except Exception as error:
             print(f"起動時の淡色地図切替に失敗しました: {error}")
@@ -660,6 +666,7 @@ class SimpleCadApp:
 
         background_filename = self.get_panel_filename(self.background_image_path, max_chars=26)
         lines = [
+            f"保存先: {self.get_short_output_dir()}",
             f"背景: {background_filename}",
             f"地図種別: {get_tile_type_label(self.gsi_settings['tile_type'])}",
         ]
@@ -754,6 +761,125 @@ class SimpleCadApp:
 
         return get_storable_image_path(image_path)
 
+    def get_short_output_dir(self):
+        """Return a compact display path for the current output directory."""
+
+        home_dir = os.path.expanduser("~")
+        output_dir = os.path.abspath(self.output_dir)
+        if output_dir.startswith(home_dir):
+            return "~" + output_dir[len(home_dir):]
+        return output_dir
+
+    def get_output_assets_dir(self):
+        """Return the assets directory under the current output folder."""
+
+        return os.path.join(self.output_dir, "assets")
+
+    def ensure_output_directory(self):
+        """Create the configured output directory tree when needed."""
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.get_output_assets_dir(), exist_ok=True)
+
+    def set_output_dir(self, output_dir, show_notice=True):
+        """Persist a new output directory and refresh the UI."""
+
+        self.output_settings = save_output_settings({"output_dir": output_dir})
+        self.output_dir = self.output_settings["output_dir"]
+        self.ensure_output_directory()
+        print(f"保存先を変更しました: {self.output_dir}")
+        if show_notice:
+            self.show_temporary_notice("保存先を更新しました", duration_ms=2200)
+        self.update_layer_ui()
+        return True
+
+    def prompt_output_dir(self):
+        """Open a native macOS folder picker when available."""
+
+        script = (
+            'tell application "System Events"\n'
+            'activate\n'
+            'try\n'
+            'set chosenFolder to choose folder with prompt "保存先フォルダを選択してください"\n'
+            'return POSIX path of chosenFolder\n'
+            'on error number -128\n'
+            'return "__CANCELLED__"\n'
+            'end try\n'
+            'end tell'
+        )
+
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            print(f"保存先ダイアログを開けませんでした: {error}")
+            return None
+
+        output = result.stdout.strip()
+        if output == "__CANCELLED__":
+            return None
+
+        if result.returncode != 0:
+            print(f"保存先ダイアログエラー: {result.stderr.strip()}")
+            return None
+
+        return output
+
+    def choose_output_dir(self):
+        """Open the folder picker and save the selected output directory."""
+
+        output_dir = self.prompt_output_dir()
+        if output_dir is None:
+            self.show_temporary_notice("保存先の選択をキャンセルしました", duration_ms=1800)
+            return False
+
+        self.set_output_dir(output_dir)
+        return True
+
+    def ensure_output_background_image(self):
+        """Copy the current background image into output_dir/assets when needed."""
+
+        self.ensure_output_directory()
+
+        source_path = self.normalize_image_path(self.background_image_path)
+        output_assets_dir = self.get_output_assets_dir()
+        output_image_path = os.path.join(output_assets_dir, os.path.basename(source_path))
+
+        if os.path.abspath(source_path) != os.path.abspath(output_image_path):
+            shutil.copy2(source_path, output_image_path)
+
+        return output_image_path
+
+    def build_scale_output_data(self, output_background_image_path):
+        """Build scale.json data for the configured output folder."""
+
+        data = dict(self.scale_metadata) if isinstance(self.scale_metadata, dict) else {}
+        data.update(
+            {
+                "meters_per_pixel": self.meters_per_pixel,
+                "image_file": get_storable_image_path(
+                    output_background_image_path,
+                    base_dir=self.output_dir,
+                ),
+                "image_filename": self.get_image_identity(output_background_image_path),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        return data
+
+    def save_output_scale_settings(self, output_background_image_path):
+        """Save scale.json into the configured output directory."""
+
+        scale_path = os.path.join(self.output_dir, SCALE_FILE)
+        data = self.build_scale_output_data(output_background_image_path)
+        with open(scale_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        return scale_path
+
     def load_config(self):
         """背景画像パスを config.json から読み込みます。
 
@@ -801,6 +927,7 @@ class SimpleCadApp:
             zoom,
             tile_type=tile_type,
             grid_size=grid_size,
+            assets_dir=self.get_output_assets_dir(),
         )
         self.last_tile_fetch_result = result
 
@@ -1296,6 +1423,20 @@ class SimpleCadApp:
             created_at=get_existing_project_created_at(PROJECT_FILE),
         )
 
+    def build_output_project_data(self, output_background_image_path):
+        """Build project.json data for the configured output folder."""
+
+        return build_project_file_data(
+            background_image=output_background_image_path,
+            meters_per_pixel=self.meters_per_pixel,
+            current_layer=self.current_layer_key,
+            lines=self.lines,
+            current_points=self.current_points,
+            layers=LAYERS,
+            created_at=get_existing_project_created_at(PROJECT_FILE),
+            storage_base_dir=self.output_dir,
+        )
+
     def save_project(self):
         """作業途中の状態を project.json に保存します。"""
 
@@ -1560,6 +1701,40 @@ class SimpleCadApp:
             current_x += width + gap
         return created
 
+    def create_toolbar_section(
+        self,
+        title,
+        title_y,
+        row_y,
+        items,
+        x=0.03,
+        width=0.072,
+        gap=0.006,
+        height=0.038,
+    ):
+        """Create one toolbar section title plus a row of buttons."""
+
+        title_text = self.fig.text(
+            x,
+            title_y,
+            f"{title}:",
+            fontsize=9.5,
+            fontweight="bold",
+            color="#333333",
+            va="bottom",
+        )
+        self.section_titles.append(title_text)
+        buttons = self.create_toolbar_button_row(
+            items,
+            row_y,
+            x=x,
+            width=width,
+            gap=gap,
+            height=height,
+        )
+        self.toolbar_buttons.update(buttons)
+        return buttons
+
     def create_panel_info_text(self, x, y, fontsize=8.2):
         """Create a text block for right-panel information."""
 
@@ -1610,18 +1785,31 @@ class SimpleCadApp:
         """上部ツールバーと右側情報パネルを作ります。"""
 
         toolbar_x = 0.03
-        toolbar_y = 0.94
-        toolbar_button_width = 0.072
-        toolbar_gap = 0.005
-        toolbar_height = 0.04
+        title_x = toolbar_x
 
-        toolbar_items = [
+        map_items = [
             (
                 "address_search",
                 "住所",
                 self.safe_callback(
                     "toggle_address_search",
                     lambda event: self.toggle_address_search_ui(),
+                ),
+            ),
+            (
+                "center_pick",
+                "中心",
+                self.safe_callback(
+                    "start_center_pick_mode",
+                    lambda event: self.start_center_pick_mode(),
+                ),
+            ),
+            (
+                "fetch_gsi",
+                "取得",
+                self.safe_callback(
+                    "fetch_gsi_tile",
+                    lambda event: self.fetch_default_gsi_tile(),
                 ),
             ),
             (
@@ -1649,68 +1837,26 @@ class SimpleCadApp:
                 ),
             ),
             (
-                "center_pick",
-                "中心",
+                "choose_output_dir",
+                "保存先",
                 self.safe_callback(
-                    "start_center_pick_mode",
-                    lambda event: self.start_center_pick_mode(),
-                ),
-            ),
-            (
-                "fetch_gsi",
-                "取得",
-                self.safe_callback(
-                    "fetch_gsi_tile",
-                    lambda event: self.fetch_default_gsi_tile(),
-                ),
-            ),
-            (
-                "save_dxf",
-                "DXF",
-                self.safe_callback("save_dxf", lambda event: self.save_dxf()),
-            ),
-            (
-                "save_project",
-                "保存",
-                self.safe_callback("save_project", lambda event: self.save_project()),
-            ),
-            (
-                "load_project",
-                "読込",
-                self.safe_callback("load_project", lambda event: self.load_project()),
-            ),
-            (
-                "clear_drawings",
-                "クリア",
-                self.safe_callback(
-                    "clear_drawings",
-                    lambda event: self.request_clear_drawings(),
+                    "choose_output_dir",
+                    lambda event: self.choose_output_dir(),
                 ),
             ),
         ]
-        self.toolbar_buttons = self.create_toolbar_button_row(
-            toolbar_items,
-            toolbar_y,
-            x=toolbar_x,
-            width=toolbar_button_width,
-            gap=toolbar_gap,
-            height=toolbar_height,
+        map_buttons = self.create_toolbar_section(
+            "地図",
+            title_y=0.968,
+            row_y=0.927,
+            items=map_items,
+            x=title_x,
+            width=0.084,
+            gap=0.008,
+            height=0.036,
         )
-        self.address_search_button = self.toolbar_buttons["address_search"]
-        self.center_pick_button = self.toolbar_buttons["center_pick"]
-        self.gsi_tile_button = self.toolbar_buttons["fetch_gsi"]
-        self.save_button = self.toolbar_buttons["save_dxf"]
-        self.project_save_button = self.toolbar_buttons["save_project"]
-        self.project_load_button = self.toolbar_buttons["load_project"]
-        self.clear_button = self.toolbar_buttons["clear_drawings"]
-        self.map_type_buttons["seamlessphoto"] = self.toolbar_buttons["map_photo"]
-        self.map_type_buttons["pale"] = self.toolbar_buttons["map_pale"]
-        self.map_type_buttons["std"] = self.toolbar_buttons["map_std"]
 
-        layer_toolbar_y = 0.892
-        layer_toolbar_width = 0.095
-        layer_toolbar_gap = 0.007
-        layer_items = [
+        drawing_items = [
             (
                 "1",
                 "道路",
@@ -1728,8 +1874,54 @@ class SimpleCadApp:
             ),
             (
                 "4",
-                "構造",
+                "構造物",
                 self.safe_callback("change_layer:4", lambda event: self.change_layer("4")),
+            ),
+            (
+                "clear_drawings",
+                "クリア",
+                self.safe_callback(
+                    "clear_drawings",
+                    lambda event: self.request_clear_drawings(),
+                ),
+            ),
+            (
+                "undo",
+                "Undo",
+                self.safe_callback("undo", lambda event: self.undo()),
+            ),
+            (
+                "redo",
+                "Redo",
+                self.safe_callback("redo", lambda event: self.redo()),
+            ),
+        ]
+        drawing_buttons = self.create_toolbar_section(
+            "作図",
+            title_y=0.915,
+            row_y=0.874,
+            items=drawing_items,
+            x=title_x,
+            width=0.092,
+            gap=0.008,
+            height=0.036,
+        )
+
+        save_items = [
+            (
+                "save_dxf",
+                "DXF",
+                self.safe_callback("save_dxf", lambda event: self.save_dxf()),
+            ),
+            (
+                "save_project",
+                "作業保存",
+                self.safe_callback("save_project", lambda event: self.save_project()),
+            ),
+            (
+                "load_project",
+                "作業読込",
+                self.safe_callback("load_project", lambda event: self.load_project()),
             ),
             (
                 "scale",
@@ -1753,35 +1945,53 @@ class SimpleCadApp:
                 ),
             ),
         ]
-        layer_toolbar = self.create_toolbar_button_row(
-            layer_items,
-            layer_toolbar_y,
-            x=toolbar_x,
-            width=layer_toolbar_width,
-            gap=layer_toolbar_gap,
-            height=0.036,
+        save_buttons = self.create_toolbar_section(
+            "保存",
+            title_y=0.862,
+            row_y=0.821,
+            items=save_items,
+            x=title_x,
+            width=0.105,
+            gap=0.01,
+            height=0.034,
         )
+
+        self.address_search_button = map_buttons["address_search"]
+        self.center_pick_button = map_buttons["center_pick"]
+        self.gsi_tile_button = map_buttons["fetch_gsi"]
+        self.output_dir_button = map_buttons["choose_output_dir"]
+        self.map_type_buttons["seamlessphoto"] = map_buttons["map_photo"]
+        self.map_type_buttons["pale"] = map_buttons["map_pale"]
+        self.map_type_buttons["std"] = map_buttons["map_std"]
+
         for key in ("1", "2", "3", "4"):
-            self.layer_buttons[key] = layer_toolbar[key]
-        self.scale_button = layer_toolbar["scale"]
-        self.close_button = layer_toolbar["close_polygon"]
-        self.gsi_settings_button = layer_toolbar["gsi_settings"]
+            self.layer_buttons[key] = drawing_buttons[key]
+        self.clear_button = drawing_buttons["clear_drawings"]
+        self.undo_button = drawing_buttons["undo"]
+        self.redo_button = drawing_buttons["redo"]
+
+        self.save_button = save_buttons["save_dxf"]
+        self.project_save_button = save_buttons["save_project"]
+        self.project_load_button = save_buttons["load_project"]
+        self.scale_button = save_buttons["scale"]
+        self.close_button = save_buttons["close_polygon"]
+        self.gsi_settings_button = save_buttons["gsi_settings"]
 
         panel_x = 0.82
         self.panel_status_text = self.fig.text(
             panel_x,
-            0.97,
+            0.965,
             "",
             fontsize=8.7,
             color="#222222",
             va="top",
             linespacing=1.20,
         )
-        self.info_title_text = self.create_panel_title("情報", 0.905)
+        self.info_title_text = self.create_panel_title("情報", 0.89)
         self.section_titles.append(self.info_title_text)
         self.layer_title_text = self.fig.text(
             panel_x,
-            0.872,
+            0.857,
             "",
             fontsize=8.7,
             color="#222222",
@@ -1789,14 +1999,14 @@ class SimpleCadApp:
         )
         self.info_detail_button = self.create_panel_button(
             "詳細",
-            0.872,
+            0.855,
             self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
             x=0.91,
             width=0.06,
             height=0.03,
         )
-        self.scale_reference_text = self.create_panel_info_text(panel_x, 0.84, fontsize=8.1)
-        self.measurement_text = self.create_panel_info_text(panel_x, 0.58, fontsize=8.1)
+        self.scale_reference_text = self.create_panel_info_text(panel_x, 0.825, fontsize=8.1)
+        self.measurement_text = self.create_panel_info_text(panel_x, 0.565, fontsize=8.1)
         self.update_layer_ui()
 
     def safe_callback(self, name, callback):
@@ -1853,7 +2063,7 @@ class SimpleCadApp:
 
         if self.clear_button is not None:
             self.clear_button.label.set_text(
-                "本当に消す" if self.clear_confirm_pending else "作図クリア"
+                "消去確認" if self.clear_confirm_pending else "クリア"
             )
 
         for tile_type, button in self.map_type_buttons.items():
@@ -3531,22 +3741,37 @@ class SimpleCadApp:
         if len(self.current_points) >= 2:
             self.finish_current_line(closed=False)
 
+        output_background_image_path = self.ensure_output_background_image()
+        output_project_path = os.path.join(self.output_dir, PROJECT_FILE)
+        output_scale_path = self.save_output_scale_settings(output_background_image_path)
+        output_project_data = self.build_output_project_data(output_background_image_path)
+        success, error_message = save_project_file(output_project_path, output_project_data)
+        if not success:
+            print(error_message)
+            self.show_temporary_notice("project.json を保存できませんでした", duration_ms=2600)
+            return
+
         filename = export_dxf(
             lines=self.lines,
-            background_image_path=self.background_image_path,
+            background_image_path=output_background_image_path,
             image_width=self.image.width,
             image_height=self.image.height,
             meters_per_pixel=self.meters_per_pixel,
+            output_dir=self.output_dir,
+            background_image_reference_path=os.path.relpath(
+                output_background_image_path,
+                self.output_dir,
+            ),
         )
 
         print("")
         print(f"DXF保存完了: {filename}")
         print(f"保存時縮尺: 1px = {self.meters_per_pixel:.4f}m")
-        print(
-            "背景画像は外部参照です。DXFと "
-            f"{os.path.basename(self.background_image_path)} "
-            "を同じフォルダで管理してください"
-        )
+        print(f"保存先: {self.output_dir}")
+        print(f"背景画像: {output_background_image_path}")
+        print(f"project.json: {output_project_path}")
+        print(f"scale.json: {output_scale_path}")
+        self.show_temporary_notice("DXFと関連ファイルを保存しました", duration_ms=2400)
 
     # --------------------------------------------------------
     # ヘルプ

@@ -176,13 +176,17 @@ def build_project_data(
     current_points,
     layers=LAYERS,
     created_at=None,
+    storage_base_dir=None,
 ):
     """Build the project.json dictionary without changing its shape."""
 
     now = datetime.now().isoformat(timespec="seconds")
 
     return {
-        "background_image": get_storable_image_path(background_image),
+        "background_image": get_storable_image_path(
+            background_image,
+            base_dir=storage_base_dir,
+        ),
         "meters_per_pixel": meters_per_pixel,
         "current_layer": current_layer,
         "lines": serialize_lines(lines, layers=layers, current_layer_key=current_layer),

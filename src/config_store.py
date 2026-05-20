@@ -16,11 +16,13 @@ def normalize_image_path(image_path):
     return os.path.abspath(image_path)
 
 
-def get_storable_image_path(image_path):
+def get_storable_image_path(image_path, base_dir=None):
     """Store project-local paths as relative paths."""
 
     absolute_path = normalize_image_path(image_path)
-    cwd = os.path.abspath(os.getcwd())
+    if base_dir is None:
+        base_dir = os.getcwd()
+    cwd = os.path.abspath(os.path.expanduser(base_dir))
 
     try:
         common_path = os.path.commonpath([cwd, absolute_path])
@@ -89,4 +91,3 @@ def get_background_image_path(default=DEFAULT_IMAGE_FILE, config_file=CONFIG_FIL
         return default_image_path
 
     return image_path
-

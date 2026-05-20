@@ -465,14 +465,20 @@ def save_scale_data(scale_data, scale_file=SCALE_FILE):
         json.dump(scale_data, file, ensure_ascii=False, indent=2)
 
 
-def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
+def fetch_gsi_tile(lat, lon, zoom, tile_type="std", assets_dir=ASSETS_DIR):
     """Fetch one GSI center tile and update config.json and scale.json."""
 
     zoom = int(zoom)
     tile_type = normalize_tile_type(tile_type)
     tile_x, tile_y = latlon_to_tile(lat, lon, zoom)
     url = tile_to_url(tile_type, zoom, tile_x, tile_y)
-    output_path = build_tile_output_path(zoom, tile_x, tile_y, tile_type=tile_type)
+    output_path = build_tile_output_path(
+        zoom,
+        tile_x,
+        tile_y,
+        tile_type=tile_type,
+        assets_dir=assets_dir,
+    )
     download_tile(url, output_path)
 
     meters_per_pixel = calculate_meters_per_pixel(lat, zoom)
@@ -504,7 +510,7 @@ def fetch_gsi_tile(lat, lon, zoom, tile_type="std"):
     }
 
 
-def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
+def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3, assets_dir=ASSETS_DIR):
     """Fetch a GSI tile grid, merge it, and update config.json and scale.json."""
 
     zoom = int(zoom)
@@ -520,6 +526,7 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
             tile["x"],
             tile["y"],
             tile_type=tile_type,
+            assets_dir=assets_dir,
         )
         download_tile(url, tile_path)
         downloaded_tiles.append(
@@ -539,6 +546,7 @@ def fetch_gsi_tile_grid(lat, lon, zoom, tile_type="std", grid_size=3):
         center_tile_y,
         grid_size,
         tile_type=tile_type,
+        assets_dir=assets_dir,
     )
     merge_tiles(downloaded_tiles, output_path, grid_size=grid_size)
 

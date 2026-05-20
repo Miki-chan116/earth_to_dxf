@@ -8,7 +8,9 @@ CONFIG_FILE = "config.json"
 SCALE_FILE = "scale.json"
 PROJECT_FILE = "project.json"
 GSI_SETTINGS_FILE = "gsi_settings.json"
+OUTPUT_SETTINGS_FILE = "output_settings.json"
 ASSETS_DIR = "assets"
+DEFAULT_OUTPUT_DIR = "~/Desktop/earth_to_dxf_outputs"
 
 GSI_DEFAULT_LAT = 33.839
 GSI_DEFAULT_LON = 132.765
