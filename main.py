@@ -54,6 +54,11 @@ from src.project_store import (
     save_project as save_project_file,
 )
 from src.dxf_export import export_dxf
+from src.geometry_utils import (
+    calculate_distance_m,
+    calculate_polygon_area_m2,
+    calculate_polyline_length_m,
+)
 from src.geocoder import (
     GeocodingError,
     geocode_address,
@@ -257,6 +262,7 @@ class SimpleCadApp:
         self.operation_title_text = None
         self.info_title_text = None
         self.scale_reference_text = None
+        self.measurement_text = None
         self.layer_buttons = {}
         self.ui_axes_set = set()
         self.save_button = None
@@ -296,17 +302,110 @@ class SimpleCadApp:
         )
         selected = "あり" if self.selected_point is not None else "なし"
         mouse_position = self.get_mouse_position_message()
+        measurement = self.get_measurement_status_message()
         return (
             f"MODE: {mode}  |  "
             f"レイヤ: {self.current_layer()['label']}  |  "
             f"縮尺: 1px = {self.meters_per_pixel:.4f}m  |  "
             f"{mouse_position}  |  "
+            f"{measurement}  |  "
             f"点数: {total_points}点 "
             f"(作図中 {len(self.current_points)} / 縮尺 {len(self.scale_points)}/2)  |  "
             f"作図中: {len(self.current_points)}点  |  "
             f"選択: {selected}  |  "
             f"十字: {'ON' if self.crosshair_enabled else 'OFF'}({self.crosshair_mode})"
         )
+
+    def recalculate_line_metrics(self, line):
+        """Update cached length and area for one confirmed geometry."""
+
+        points = line.get("points", [])
+        closed = bool(line.get("closed", False))
+        line["length_m"] = calculate_polyline_length_m(
+            points,
+            self.meters_per_pixel,
+            closed=closed,
+        )
+        line["area_m2"] = (
+            calculate_polygon_area_m2(points, self.meters_per_pixel) if closed else 0.0
+        )
+        return line
+
+    def recalculate_all_line_metrics(self):
+        """Refresh all cached measurements after scale or geometry changes."""
+
+        for line in self.lines:
+            self.recalculate_line_metrics(line)
+
+    def get_current_polyline_length_m(self):
+        """Return the current drawing polyline length in meters."""
+
+        return calculate_polyline_length_m(self.current_points, self.meters_per_pixel)
+
+    def get_selected_line(self):
+        """Return the selected confirmed line when a point on it is selected."""
+
+        if not isinstance(self.selected_point, tuple):
+            return None
+        if len(self.selected_point) < 2 or self.selected_point[0] != "line":
+            return None
+
+        line_index = self.selected_point[1]
+        if not 0 <= line_index < len(self.lines):
+            return None
+
+        return self.lines[line_index]
+
+    def get_measurement_status_message(self):
+        """Return a compact measurement string for the status bar."""
+
+        if len(self.scale_points) == 2:
+            distance_m = calculate_distance_m(
+                self.scale_points[0],
+                self.scale_points[1],
+                self.meters_per_pixel,
+            )
+            return f"2点距離: {distance_m:.2f}m"
+
+        if len(self.current_points) >= 2:
+            return f"作図延長: {self.get_current_polyline_length_m():.2f}m"
+
+        selected_line = self.get_selected_line()
+        if selected_line is not None:
+            message = f"選択延長: {selected_line.get('length_m', 0.0):.2f}m"
+            if selected_line.get("closed", False):
+                message += f" / 面積: {selected_line.get('area_m2', 0.0):.2f}㎡"
+            return message
+
+        return "距離: -"
+
+    def get_measurement_panel_message(self):
+        """Return measurement details for the right-side info panel."""
+
+        if len(self.scale_points) == 2:
+            distance_m = calculate_distance_m(
+                self.scale_points[0],
+                self.scale_points[1],
+                self.meters_per_pixel,
+            )
+            return f"距離:\n{distance_m:.2f} m\n面積:\n-"
+
+        lines = []
+        if len(self.current_points) >= 2:
+            lines.append("作図中延長:")
+            lines.append(f"{self.get_current_polyline_length_m():.2f} m")
+
+        selected_line = self.get_selected_line()
+        if selected_line is not None:
+            lines.append("選択図形:")
+            lines.append(f"延長 {selected_line.get('length_m', 0.0):.2f} m")
+            if selected_line.get("closed", False):
+                lines.append(f"面積 {selected_line.get('area_m2', 0.0):.2f} ㎡")
+
+        if not lines:
+            return "距離:\n-\n面積:\n-"
+
+        return "\n".join(lines)
 
     def get_mouse_position_message(self):
         """ステータスバー用に現在マウス位置を画像pxとCAD mで返します。"""
@@ -1132,6 +1231,7 @@ class SimpleCadApp:
             default_layer_key=self.current_layer_key,
         )
         self.current_points = deserialize_project_points(data.get("current_points", []))
+        self.recalculate_all_line_metrics()
         self.selected_point = None
         self.scale_mode = False
         self.scale_points = []
@@ -1331,6 +1431,15 @@ class SimpleCadApp:
             va="top",
             linespacing=1.15,
         )
+        self.measurement_text = self.fig.text(
+            0.835,
+            0.148,
+            "",
+            fontsize=8.2,
+            color="#222222",
+            va="top",
+            linespacing=1.18,
+        )
 
         y = 0.902
         self.save_button = self.create_panel_button(
@@ -1436,6 +1545,8 @@ class SimpleCadApp:
             self.scale_reference_text.set_text(
                 self.get_reference_scale_message(detailed=self.info_detail_expanded)
             )
+        if self.measurement_text is not None:
+            self.measurement_text.set_text(self.get_measurement_panel_message())
 
         if self.info_detail_button is not None:
             self.info_detail_button.label.set_text(
@@ -2145,6 +2256,33 @@ class SimpleCadApp:
                 zorder=22,
             )
 
+        selected_line = self.get_selected_line()
+        if selected_line is not None:
+            measurement_lines = [f"延長: {selected_line.get('length_m', 0.0):.2f} m"]
+            if selected_line.get("closed", False):
+                measurement_lines.append(
+                    f"面積: {selected_line.get('area_m2', 0.0):.2f} ㎡"
+                )
+            self.ax.text(
+                0.985,
+                0.975,
+                "\n".join(measurement_lines),
+                transform=self.ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=11,
+                fontweight="bold",
+                color="#ffffff",
+                bbox={
+                    "boxstyle": "round,pad=0.35",
+                    "facecolor": "#222222",
+                    "edgecolor": "#ffffff",
+                    "alpha": 0.74,
+                },
+                picker=False,
+                zorder=24,
+            )
+
         if self.action_message:
             self.ax.text(
                 0.015,
@@ -2584,11 +2722,13 @@ class SimpleCadApp:
         self.push_undo()
 
         self.lines.append(
-            {
-                "layer": self.current_layer().copy(),
-                "points": self.current_points.copy(),
-                "closed": closed,
-            }
+            self.recalculate_line_metrics(
+                {
+                    "layer": self.current_layer().copy(),
+                    "points": self.current_points.copy(),
+                    "closed": closed,
+                }
+            )
         )
 
         print(
@@ -2759,6 +2899,7 @@ class SimpleCadApp:
 
                 if 0 <= point_index < len(line["points"]):
                     line["points"].pop(point_index)
+                    self.recalculate_line_metrics(line)
                     print("確定済み図形の点を削除しました")
 
                 # 線は2点未満、閉じた面は3点未満になると図形として成立しません。
@@ -2919,6 +3060,7 @@ class SimpleCadApp:
 
         self.push_undo()
         self.meters_per_pixel = real_distance / pixel_distance
+        self.recalculate_all_line_metrics()
         self.scale_needs_reset = False
         self.scale_reset_message = ""
         self.save_scale_settings()

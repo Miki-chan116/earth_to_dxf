@@ -65,6 +65,8 @@ def serialize_lines(lines, layers=LAYERS, current_layer_key="1"):
                 "layer": layer,
                 "points": serialize_points(line.get("points", [])),
                 "closed": bool(line.get("closed", False)),
+                "length_m": float(line.get("length_m", 0.0)),
+                "area_m2": float(line.get("area_m2", 0.0)),
             }
         )
 
@@ -108,6 +110,8 @@ def deserialize_lines(lines, layers=LAYERS, default_layer_key="1"):
                 "layer": layer.copy(),
                 "points": points,
                 "closed": bool(line.get("closed", False)),
+                "length_m": float(line.get("length_m", 0.0)),
+                "area_m2": float(line.get("area_m2", 0.0)),
             }
         )
 
