@@ -1,8 +1,10 @@
 {
-  "latitude": 33.839,
-  "longitude": 132.765,
+  "latitude": 33.841289,
+  "longitude": 132.766214,
   "zoom": 18,
   "grid_size": 3,
   "tile_type": "seamlessphoto",
-  "updated_at": "2026-05-19T22:06:26"
+  "address": "愛媛県松山市一番町4丁目4-2",
+  "display_name": "愛媛県松山市一番町四丁目",
+  "updated_at": "2026-05-20T18:51:04"
 }

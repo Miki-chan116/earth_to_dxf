@@ -54,6 +54,11 @@ from src.project_store import (
     save_project as save_project_file,
 )
 from src.dxf_export import export_dxf
+from src.geocoder import (
+    GeocodingError,
+    geocode_address,
+    update_gsi_settings_from_address,
+)
 from src.gsi_tile import (
     fetch_gsi_tile_grid,
     get_tile_type_label,
@@ -187,6 +192,14 @@ class SimpleCadApp:
         self.gsi_settings_cancel_button = None
         self.gsi_settings_error_text = None
         self.gsi_settings_button = None
+        self.address_search_visible = False
+        self.address_search_texts = []
+        self.address_search_axes = []
+        self.address_search_box = None
+        self.address_search_ok_button = None
+        self.address_search_cancel_button = None
+        self.address_search_error_text = None
+        self.address_search_button = None
         self.crosshair_mode = (
             CROSSHAIR_MODE if CROSSHAIR_MODE in CROSSHAIR_MODES else "small"
         )
@@ -427,6 +440,9 @@ class SimpleCadApp:
             f"地図: {get_tile_type_label(self.gsi_settings['tile_type'])}",
             f"換算: 1px={self.meters_per_pixel:.4f}m",
         ]
+        address_label = self.gsi_settings.get("display_name") or self.gsi_settings.get("address")
+        if address_label:
+            lines.insert(0, f"検索地点: {address_label}")
 
         if self.scale_needs_reset:
             lines.append("縮尺再設定が必要")
@@ -593,6 +609,200 @@ class SimpleCadApp:
         )
         self.redraw(reset_view=True)
 
+    def toggle_address_search_ui(self):
+        """住所検索フォームを開閉します。"""
+
+        if self.address_search_visible:
+            self.cleanup_address_search_ui()
+        else:
+            self.show_address_search_ui()
+
+    def show_address_search_ui(self):
+        """matplotlib画面内に住所入力欄を表示します。"""
+
+        self.cleanup_address_search_ui()
+        self.cleanup_gsi_settings_ui()
+        self.address_search_visible = True
+
+        title = self.fig.text(
+            0.11,
+            0.875,
+            "住所検索",
+            fontsize=12,
+            fontweight="bold",
+            color="#222222",
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "#ffffff",
+                "edgecolor": "#666666",
+                "alpha": 0.94,
+            },
+            zorder=30,
+        )
+        self.address_search_texts.append(title)
+
+        current_address = self.gsi_settings.get("address", "")
+        label = self.fig.text(
+            0.12,
+            0.805,
+            "住所",
+            fontsize=9,
+            color="#222222",
+            zorder=30,
+        )
+        self.address_search_texts.append(label)
+
+        input_ax = self.register_ui_axes(self.fig.add_axes([0.17, 0.792, 0.27, 0.04]))
+        self.address_search_box = TextBox(
+            input_ax,
+            "",
+            initial=current_address,
+            color="#ffffff",
+            hovercolor="#eef5ff",
+        )
+        self.address_search_axes.append(input_ax)
+
+        help_text = self.fig.text(
+            0.12,
+            0.755,
+            "例: 東京都千代田区霞が関1-3-1",
+            fontsize=8,
+            color="#333333",
+            zorder=30,
+        )
+        self.address_search_texts.append(help_text)
+
+        self.address_search_error_text = self.fig.text(
+            0.12,
+            0.725,
+            "",
+            fontsize=8,
+            color="#b00020",
+            zorder=30,
+        )
+
+        self.address_search_ok_button = self.create_panel_button(
+            "検索",
+            0.672,
+            self.safe_callback("apply_address_search", lambda event: self.apply_address_search()),
+            x=0.12,
+            width=0.12,
+            height=0.035,
+        )
+        self.address_search_cancel_button = self.create_panel_button(
+            "閉じる",
+            0.672,
+            self.safe_callback(
+                "close_address_search",
+                lambda event: self.cleanup_address_search_ui(),
+            ),
+            x=0.255,
+            width=0.12,
+            height=0.035,
+        )
+
+        self.address_search_box.on_submit(lambda text: self.apply_address_search())
+        self.fig.canvas.draw_idle()
+
+    def cleanup_address_search_ui(self):
+        """住所検索フォームを閉じます。"""
+
+        if self.address_search_box is not None:
+            try:
+                self.address_search_box.disconnect_events()
+            except Exception:
+                pass
+
+        for ax in self.address_search_axes:
+            self.unregister_ui_axes(ax)
+            try:
+                ax.remove()
+            except ValueError:
+                pass
+
+        for button in (
+            self.address_search_ok_button,
+            self.address_search_cancel_button,
+        ):
+            if button is not None:
+                self.unregister_ui_axes(button.ax)
+                try:
+                    button.disconnect_events()
+                except Exception:
+                    pass
+                try:
+                    button.ax.remove()
+                except ValueError:
+                    pass
+
+        for text in self.address_search_texts:
+            try:
+                text.remove()
+            except ValueError:
+                pass
+
+        if self.address_search_error_text is not None:
+            try:
+                self.address_search_error_text.remove()
+            except ValueError:
+                pass
+
+        self.address_search_visible = False
+        self.address_search_texts = []
+        self.address_search_axes = []
+        self.address_search_box = None
+        self.address_search_ok_button = None
+        self.address_search_cancel_button = None
+        self.address_search_error_text = None
+        self.fig.canvas.draw_idle()
+
+    def set_address_search_error(self, message):
+        """住所検索フォームへエラーを表示します。"""
+
+        if self.address_search_error_text is not None:
+            self.address_search_error_text.set_text(message)
+            self.fig.canvas.draw_idle()
+        else:
+            self.show_temporary_notice(message)
+
+    def apply_address_search(self):
+        """入力住所を緯度経度に変換し、地理院タイルを取得します。"""
+
+        if self.address_search_box is None:
+            return False
+
+        address = self.address_search_box.text.strip()
+        if not address:
+            self.set_address_search_error("住所を入力してください")
+            return False
+
+        self.set_address_search_error("検索中...")
+        self.fig.canvas.draw_idle()
+
+        try:
+            geocode_result = geocode_address(address)
+            self.gsi_settings = update_gsi_settings_from_address(
+                address,
+                geocode_result,
+                self.gsi_settings,
+            )
+        except (GeocodingError, OSError, ValueError) as error:
+            message = str(error)
+            print(f"住所検索エラー: {message}")
+            self.set_address_search_error(message)
+            return False
+
+        print(
+            "住所検索完了: "
+            f"{self.gsi_settings.get('display_name') or address} "
+            f"lat={self.gsi_settings['latitude']}, "
+            f"lon={self.gsi_settings['longitude']}"
+        )
+
+        self.cleanup_address_search_ui()
+        self.fetch_default_gsi_tile()
+        return True
+
     def toggle_gsi_settings_ui(self):
         """地理院タイル取得設定の入力欄を開閉します。"""
 
@@ -605,6 +815,7 @@ class SimpleCadApp:
         """matplotlib画面内に地理院タイル取得設定フォームを表示します。"""
 
         self.cleanup_gsi_settings_ui()
+        self.cleanup_address_search_ui()
         self.gsi_settings_visible = True
 
         panel_x = 0.11
@@ -1150,6 +1361,12 @@ class SimpleCadApp:
             "取得設定",
             y,
             self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
+        )
+        y = self.next_panel_y(y)
+        self.address_search_button = self.create_panel_button(
+            "住所検索",
+            y,
+            self.safe_callback("toggle_address_search", lambda event: self.toggle_address_search_ui()),
         )
         y = self.next_panel_y(y)
         self.gsi_tile_button = self.create_panel_button(

@@ -42,6 +42,7 @@ def default_gsi_settings():
     """Return default GSI tile fetch settings."""
 
     return {
+        "address": "",
         "latitude": GSI_DEFAULT_LAT,
         "longitude": GSI_DEFAULT_LON,
         "zoom": GSI_DEFAULT_ZOOM,
@@ -144,13 +145,18 @@ def load_gsi_settings(path=GSI_SETTINGS_FILE):
         return settings
 
     try:
-        return validate_gsi_settings(
+        normalized = validate_gsi_settings(
             data.get("latitude", settings["latitude"]),
             data.get("longitude", settings["longitude"]),
             data.get("zoom", settings["zoom"]),
             data.get("grid_size", settings["grid_size"]),
             data.get("tile_type", settings["tile_type"]),
         )
+        for key in ("address", "display_name", "updated_at"):
+            value = data.get(key)
+            if isinstance(value, str):
+                normalized[key] = value
+        return normalized
     except ValueError as error:
         print(f"{path} の設定が不正です: {error}")
         return settings
@@ -167,11 +173,17 @@ def save_gsi_settings(settings, path=GSI_SETTINGS_FILE):
         settings.get("tile_type", GSI_DEFAULT_TILE_TYPE),
     )
     data = dict(normalized)
-    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    for key in ("address", "display_name"):
+        value = settings.get(key)
+        if isinstance(value, str):
+            data[key] = value
+    data["updated_at"] = settings.get("updated_at") or datetime.now().isoformat(timespec="seconds")
 
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
 
+    normalized.update({key: data[key] for key in ("address", "display_name") if key in data})
+    normalized["updated_at"] = data["updated_at"]
     return normalized
 
 
