@@ -240,6 +240,7 @@ class SimpleCadApp:
         # Pan操作用の状態です。
         self.space_down = False
         self.pan_active = False
+        self.pan_button = None
         self.pan_start = None
         self.pan_start_screen = None
         self.pan_start_xlim = None
@@ -262,7 +263,7 @@ class SimpleCadApp:
 
         self.fig, self.image_ax = plt.subplots(figsize=(12, 9))
         self.ax = self.image_ax
-        self.fig.subplots_adjust(right=0.64, bottom=0.12)
+        self.fig.subplots_adjust(right=0.80, bottom=0.12, top=0.80)
 
         self.status_text = self.fig.text(
             0.02,
@@ -280,6 +281,7 @@ class SimpleCadApp:
         self.section_titles = []
         self.panel_status_text = None
         self.layer_buttons = {}
+        self.toolbar_buttons = {}
         self.ui_axes_set = set()
         self.save_button = None
         self.undo_button = None
@@ -974,10 +976,12 @@ class SimpleCadApp:
         try:
             geocode_result = geocode_address(address)
             self.last_geocode_result = geocode_result
+            search_settings = dict(self.gsi_settings)
+            search_settings["tile_type"] = "seamlessphoto"
             self.gsi_settings = update_gsi_settings_from_address(
                 address,
                 geocode_result,
-                self.gsi_settings,
+                search_settings,
             )
         except (GeocodingError, OSError, ValueError) as error:
             self.pending_address_search_log = False
@@ -1518,6 +1522,44 @@ class SimpleCadApp:
 
         return button
 
+    def create_toolbar_button(self, label, x, y, width, callback=None, height=0.038):
+        """上部ツールバー用のボタンを作ります。"""
+
+        return self.create_panel_button(
+            label,
+            y,
+            callback,
+            x=x,
+            width=width,
+            height=height,
+        )
+
+    def create_toolbar_button_row(
+        self,
+        items,
+        y,
+        x=0.03,
+        width=0.072,
+        gap=0.005,
+        height=0.038,
+    ):
+        """Create a left-to-right toolbar row from (key, label, callback) items."""
+
+        created = {}
+        current_x = x
+        for key, label, callback in items:
+            button = self.create_toolbar_button(
+                label,
+                current_x,
+                y,
+                width,
+                callback=callback,
+                height=height,
+            )
+            created[key] = button
+            current_x += width + gap
+        return created
+
     def create_panel_info_text(self, x, y, fontsize=8.2):
         """Create a text block for right-panel information."""
 
@@ -1565,179 +1607,196 @@ class SimpleCadApp:
         return left_button, right_button
 
     def setup_widgets(self):
-        """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
+        """上部ツールバーと右側情報パネルを作ります。"""
 
-        panel_x = 0.68
-        button_width = 0.125
-        button_gap = 0.012
-        button_height = 0.038
-        row_gap = 0.010
-        full_width = (button_width * 2) + button_gap
+        toolbar_x = 0.03
+        toolbar_y = 0.94
+        toolbar_button_width = 0.072
+        toolbar_gap = 0.005
+        toolbar_height = 0.04
 
+        toolbar_items = [
+            (
+                "address_search",
+                "住所",
+                self.safe_callback(
+                    "toggle_address_search",
+                    lambda event: self.toggle_address_search_ui(),
+                ),
+            ),
+            (
+                "map_photo",
+                "写真",
+                self.safe_callback(
+                    "change_map_type:seamlessphoto",
+                    lambda event: self.change_map_type("seamlessphoto"),
+                ),
+            ),
+            (
+                "map_pale",
+                "淡色",
+                self.safe_callback(
+                    "change_map_type:pale",
+                    lambda event: self.change_map_type("pale"),
+                ),
+            ),
+            (
+                "map_std",
+                "標準",
+                self.safe_callback(
+                    "change_map_type:std",
+                    lambda event: self.change_map_type("std"),
+                ),
+            ),
+            (
+                "center_pick",
+                "中心",
+                self.safe_callback(
+                    "start_center_pick_mode",
+                    lambda event: self.start_center_pick_mode(),
+                ),
+            ),
+            (
+                "fetch_gsi",
+                "取得",
+                self.safe_callback(
+                    "fetch_gsi_tile",
+                    lambda event: self.fetch_default_gsi_tile(),
+                ),
+            ),
+            (
+                "save_dxf",
+                "DXF",
+                self.safe_callback("save_dxf", lambda event: self.save_dxf()),
+            ),
+            (
+                "save_project",
+                "保存",
+                self.safe_callback("save_project", lambda event: self.save_project()),
+            ),
+            (
+                "load_project",
+                "読込",
+                self.safe_callback("load_project", lambda event: self.load_project()),
+            ),
+            (
+                "clear_drawings",
+                "クリア",
+                self.safe_callback(
+                    "clear_drawings",
+                    lambda event: self.request_clear_drawings(),
+                ),
+            ),
+        ]
+        self.toolbar_buttons = self.create_toolbar_button_row(
+            toolbar_items,
+            toolbar_y,
+            x=toolbar_x,
+            width=toolbar_button_width,
+            gap=toolbar_gap,
+            height=toolbar_height,
+        )
+        self.address_search_button = self.toolbar_buttons["address_search"]
+        self.center_pick_button = self.toolbar_buttons["center_pick"]
+        self.gsi_tile_button = self.toolbar_buttons["fetch_gsi"]
+        self.save_button = self.toolbar_buttons["save_dxf"]
+        self.project_save_button = self.toolbar_buttons["save_project"]
+        self.project_load_button = self.toolbar_buttons["load_project"]
+        self.clear_button = self.toolbar_buttons["clear_drawings"]
+        self.map_type_buttons["seamlessphoto"] = self.toolbar_buttons["map_photo"]
+        self.map_type_buttons["pale"] = self.toolbar_buttons["map_pale"]
+        self.map_type_buttons["std"] = self.toolbar_buttons["map_std"]
+
+        layer_toolbar_y = 0.892
+        layer_toolbar_width = 0.095
+        layer_toolbar_gap = 0.007
+        layer_items = [
+            (
+                "1",
+                "道路",
+                self.safe_callback("change_layer:1", lambda event: self.change_layer("1")),
+            ),
+            (
+                "2",
+                "敷地",
+                self.safe_callback("change_layer:2", lambda event: self.change_layer("2")),
+            ),
+            (
+                "3",
+                "法面",
+                self.safe_callback("change_layer:3", lambda event: self.change_layer("3")),
+            ),
+            (
+                "4",
+                "構造",
+                self.safe_callback("change_layer:4", lambda event: self.change_layer("4")),
+            ),
+            (
+                "scale",
+                "縮尺",
+                self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
+            ),
+            (
+                "close_polygon",
+                "閉面",
+                self.safe_callback(
+                    "finish_current_line_closed",
+                    lambda event: self.finish_current_line(closed=True),
+                ),
+            ),
+            (
+                "gsi_settings",
+                "設定",
+                self.safe_callback(
+                    "toggle_gsi_settings",
+                    lambda event: self.toggle_gsi_settings_ui(),
+                ),
+            ),
+        ]
+        layer_toolbar = self.create_toolbar_button_row(
+            layer_items,
+            layer_toolbar_y,
+            x=toolbar_x,
+            width=layer_toolbar_width,
+            gap=layer_toolbar_gap,
+            height=0.036,
+        )
+        for key in ("1", "2", "3", "4"):
+            self.layer_buttons[key] = layer_toolbar[key]
+        self.scale_button = layer_toolbar["scale"]
+        self.close_button = layer_toolbar["close_polygon"]
+        self.gsi_settings_button = layer_toolbar["gsi_settings"]
+
+        panel_x = 0.82
         self.panel_status_text = self.fig.text(
             panel_x,
-            0.982,
+            0.97,
             "",
-            fontsize=8.5,
+            fontsize=8.7,
             color="#222222",
             va="top",
-            linespacing=1.18,
+            linespacing=1.20,
         )
-        _, y, section_gap = self.start_panel_section(0.925, "操作")
-        self.operation_title_text = self.section_titles[-1]
-        self.address_search_button, self.center_pick_button = self.create_panel_button_row(
-            "住所検索",
-            "中心指定",
-            y,
-            self.safe_callback("toggle_address_search", lambda event: self.toggle_address_search_ui()),
-            self.safe_callback("start_center_pick_mode", lambda event: self.start_center_pick_mode()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
+        self.info_title_text = self.create_panel_title("情報", 0.905)
+        self.section_titles.append(self.info_title_text)
+        self.layer_title_text = self.fig.text(
+            panel_x,
+            0.872,
+            "",
+            fontsize=8.7,
+            color="#222222",
+            va="top",
         )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.gsi_tile_button, self.save_button = self.create_panel_button_row(
-            "地理院",
-            "DXF",
-            y,
-            self.safe_callback("fetch_gsi_tile", lambda event: self.fetch_default_gsi_tile()),
-            self.safe_callback("save_dxf", lambda event: self.save_dxf()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.project_save_button, self.project_load_button = self.create_panel_button_row(
-            "保存",
-            "読込",
-            y,
-            self.safe_callback("save_project", lambda event: self.save_project()),
-            self.safe_callback("load_project", lambda event: self.load_project()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.address_search_from_settings_button, self.gsi_settings_button = self.create_panel_button_row(
-            "設定住所",
-            "取得設定",
-            y,
-            self.safe_callback(
-                "search_address_from_settings",
-                lambda event: self.search_address_from_settings(),
-            ),
-            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-
-        section_start = self.next_panel_section_y(y, section_gap)
-        _, y, _ = self.start_panel_section(section_start, "地図")
-        self.map_type_buttons["pale"], self.map_type_buttons["std"] = self.create_panel_button_row(
-            "淡色",
-            "標準",
-            y,
-            self.safe_callback("change_map_type:pale", lambda event: self.change_map_type("pale")),
-            self.safe_callback("change_map_type:std", lambda event: self.change_map_type("std")),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.map_type_buttons["seamlessphoto"] = self.create_panel_button(
-            "写真",
-            y,
-            self.safe_callback(
-                "change_map_type:seamlessphoto",
-                lambda event: self.change_map_type("seamlessphoto"),
-            ),
-            x=panel_x,
-            width=full_width,
-            height=button_height,
-        )
-
-        section_start = self.next_panel_section_y(y, section_gap)
-        _, y, _ = self.start_panel_section(section_start, "作図")
-        self.layer_title_text = self.section_titles[-1]
-        self.layer_buttons["1"], self.layer_buttons["2"] = self.create_panel_button_row(
-            "道路",
-            "敷地",
-            y,
-            self.safe_callback("change_layer:1", lambda event: self.change_layer("1")),
-            self.safe_callback("change_layer:2", lambda event: self.change_layer("2")),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.layer_buttons["3"], self.layer_buttons["4"] = self.create_panel_button_row(
-            "法面",
-            "構造物",
-            y,
-            self.safe_callback("change_layer:3", lambda event: self.change_layer("3")),
-            self.safe_callback("change_layer:4", lambda event: self.change_layer("4")),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.clear_button, self.scale_button = self.create_panel_button_row(
-            "クリア",
-            "縮尺",
-            y,
-            self.safe_callback("clear_drawings", lambda event: self.request_clear_drawings()),
-            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.close_button, self.undo_button = self.create_panel_button_row(
-            "閉じる",
-            "Undo",
-            y,
-            self.safe_callback(
-                "finish_current_line_closed",
-                lambda event: self.finish_current_line(closed=True),
-            ),
-            self.safe_callback("undo", lambda event: self.undo()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=row_gap)
-        self.redo_button = self.create_panel_button(
-            "Redo",
-            y,
-            self.safe_callback("redo", lambda event: self.redo()),
-            x=panel_x,
-            width=full_width,
-            height=button_height,
-        )
-
-        section_start = self.next_panel_section_y(y, section_gap)
-        _, info_y, _ = self.start_panel_section(section_start, "情報")
-        self.info_title_text = self.section_titles[-1]
         self.info_detail_button = self.create_panel_button(
             "詳細",
-            info_y - 0.002,
+            0.872,
             self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
-            x=0.885,
-            width=0.07,
+            x=0.91,
+            width=0.06,
             height=0.03,
         )
-        self.scale_reference_text = self.create_panel_info_text(panel_x, info_y - 0.045, fontsize=8.15)
-        self.measurement_text = self.create_panel_info_text(panel_x, info_y - 0.165, fontsize=8.15)
+        self.scale_reference_text = self.create_panel_info_text(panel_x, 0.84, fontsize=8.1)
+        self.measurement_text = self.create_panel_info_text(panel_x, 0.58, fontsize=8.1)
         self.update_layer_ui()
 
     def safe_callback(self, name, callback):
@@ -2801,16 +2860,10 @@ class SimpleCadApp:
             self.add_scale_point(image_point)
             return
 
-        # Space + 左ドラッグ、または中ボタンドラッグでPanします。
-        if (event.button == 1 and self.space_down) or event.button == 2:
+        # Space + 左ドラッグ、右ドラッグ、中ボタンドラッグでPanします。
+        # 将来は画面端へ寄った時の自動スクロールもここへ拡張しやすい構成です。
+        if (event.button == 1 and self.space_down) or event.button in (2, 3):
             self.start_pan(event, image_point)
-            return
-
-        # 右クリックはCAD風に「現在の線を確定」にします。
-        if event.button == 3:
-            if self.interaction_mode == "panning":
-                return
-            self.finish_current_line(closed=False)
             return
 
         # 左クリック以外は無視します。
@@ -2859,6 +2912,7 @@ class SimpleCadApp:
     def on_mouse_release(self, event):
         """ドラッグ終了時の処理です。"""
 
+        self.pan_button = None
         self.pan_active = False
         self.pan_start = None
         self.pan_start_screen = None
@@ -2953,6 +3007,7 @@ class SimpleCadApp:
         """Pan操作を開始します。"""
 
         self.pan_active = True
+        self.pan_button = getattr(event, "button", None)
         self.pan_start = point if point is not None else (event.xdata, event.ydata)
         self.pan_start_screen = (event.x, event.y)
         self.pan_start_xlim = self.ax.get_xlim()
@@ -3503,7 +3558,7 @@ class SimpleCadApp:
         print("")
         print("=== 操作方法 ===")
         print("左クリック: 点を追加 / 既存点を選択")
-        print("右クリック: 作図中の線を確定")
+        print("右ドラッグ: 表示移動(Pan)")
         print("Space + 左ドラッグ: 表示移動(Pan)")
         print("中ボタンドラッグ: 表示移動(Pan)")
         print("マウスホイール: ズーム")
