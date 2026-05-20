@@ -208,6 +208,67 @@ def latlon_to_tile(lat, lon, zoom):
     return min(max(tile_x, 0), n - 1), min(max(tile_y, 0), n - 1)
 
 
+def tile_pixel_to_latlon(tile_x, tile_y, zoom, pixel_x=0.0, pixel_y=0.0, tile_size=256):
+    """Convert tile coordinates plus pixel offset to latitude/longitude."""
+
+    n = 2 ** int(zoom)
+    world_x = float(tile_x) + (float(pixel_x) / float(tile_size))
+    world_y = float(tile_y) + (float(pixel_y) / float(tile_size))
+
+    lon = (world_x / n) * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - (2.0 * world_y / n))))
+    lat = math.degrees(lat_rad)
+    return lat, lon
+
+
+def pixel_to_latlon_in_tile_grid(
+    pixel_x,
+    pixel_y,
+    zoom,
+    center_tile_x,
+    center_tile_y,
+    grid_size,
+    tile_size=256,
+):
+    """Convert pixel coordinates inside a merged tile grid image to latitude/longitude."""
+
+    radius = int(grid_size) // 2
+    world_tile_x = float(center_tile_x) - radius
+    world_tile_y = float(center_tile_y) - radius
+    return tile_pixel_to_latlon(
+        world_tile_x,
+        world_tile_y,
+        zoom,
+        pixel_x=float(pixel_x),
+        pixel_y=float(pixel_y),
+        tile_size=tile_size,
+    )
+
+
+def latlon_to_pixel_in_tile_grid(
+    lat,
+    lon,
+    zoom,
+    center_tile_x,
+    center_tile_y,
+    grid_size,
+    tile_size=256,
+):
+    """Convert latitude/longitude to pixel coordinates inside a merged tile grid image."""
+
+    n = 2 ** int(zoom)
+    lat_rad = math.radians(float(lat))
+    world_x = ((float(lon) + 180.0) / 360.0) * n
+    world_y = (
+        1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi
+    ) / 2.0 * n
+
+    radius = int(grid_size) // 2
+    pixel_x = (world_x - (float(center_tile_x) - radius)) * float(tile_size)
+    pixel_y = (world_y - (float(center_tile_y) - radius)) * float(tile_size)
+    return pixel_x, pixel_y
+
+
 def tile_to_url(tile_type, z, x, y):
     """Build the GSI tile URL."""
 

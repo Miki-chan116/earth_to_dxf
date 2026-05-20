@@ -69,7 +69,9 @@ from src.gsi_tile import (
     fetch_gsi_tile_grid,
     get_tile_type_label,
     latlon_to_tile,
+    latlon_to_pixel_in_tile_grid,
     load_gsi_settings,
+    pixel_to_latlon_in_tile_grid,
     save_gsi_settings,
     validate_gsi_settings,
 )
@@ -192,12 +194,15 @@ class SimpleCadApp:
         self.clear_confirm_pending = False
         self.clear_confirm_timer = None
         self.info_detail_expanded = False
+        self.center_pick_mode = False
         self.gsi_settings = load_gsi_settings()
         self.prefer_startup_line_map()
         self.last_address_query = str(self.gsi_settings.get("address", "")).strip()
         self.last_geocode_result = None
         self.last_tile_fetch_result = None
+        self.scale_metadata = {}
         self.pending_address_search_log = False
+        self.pending_center_pick_notice = False
         self.gsi_settings_visible = False
         self.gsi_settings_texts = []
         self.gsi_settings_axes = []
@@ -285,6 +290,7 @@ class SimpleCadApp:
         self.gsi_tile_button = None
         self.map_type_buttons = {}
         self.clear_button = None
+        self.center_pick_button = None
         self.address_search_from_settings_button = None
         self.project_save_button = None
         self.project_load_button = None
@@ -353,6 +359,40 @@ class SimpleCadApp:
         except Exception:
             pass
 
+    def get_current_tile_grid_metadata(self):
+        """Return tile-grid metadata for the current GSI background when available."""
+
+        metadata = dict(self.scale_metadata) if isinstance(self.scale_metadata, dict) else {}
+        if not metadata:
+            return None
+
+        image_file = metadata.get("image_file")
+        if not isinstance(image_file, str) or not image_file.strip():
+            return None
+
+        metadata_image_path = self.normalize_image_path(image_file)
+        current_image_path = self.normalize_image_path(self.background_image_path)
+        if metadata_image_path != current_image_path:
+            return None
+
+        source = metadata.get("source")
+        if source == "gsi_tile_grid":
+            required = ("zoom", "center_tile_x", "center_tile_y", "grid_size")
+            if all(key in metadata for key in required):
+                return metadata
+            return None
+
+        if source == "gsi_tile":
+            if "tile_x" in metadata and "tile_y" in metadata and "zoom" in metadata:
+                converted = dict(metadata)
+                converted["center_tile_x"] = converted["tile_x"]
+                converted["center_tile_y"] = converted["tile_y"]
+                converted["grid_size"] = 1
+                converted["source"] = "gsi_tile_grid"
+                return converted
+
+        return None
+
     def get_status_message(self):
         """画面下に出すステータス文字列を作ります。"""
 
@@ -419,6 +459,9 @@ class SimpleCadApp:
     def get_measurement_status_message(self):
         """Return a compact measurement string for the status bar."""
 
+        if self.center_pick_mode:
+            return "中心指定: クリック待ち"
+
         if len(self.scale_points) == 2:
             distance_m = calculate_distance_m(
                 self.scale_points[0],
@@ -476,6 +519,9 @@ class SimpleCadApp:
         if self.action_message:
             return self.action_message
 
+        if self.center_pick_mode:
+            return "中心にしたい位置をクリックしてください"
+
         address = self.gsi_settings.get("address", "").strip()
         if address:
             return f"住所: {address}"
@@ -512,6 +558,9 @@ class SimpleCadApp:
 
         if self.interaction_mode == "scaling" or self.scale_mode:
             return "SCALE"
+
+        if self.center_pick_mode or self.interaction_mode == "center_picking":
+            return "CENTER"
 
         if self.interaction_mode == "panning" or self.pan_active:
             return "PAN"
@@ -762,6 +811,7 @@ class SimpleCadApp:
             pass
 
         self.meters_per_pixel = result["meters_per_pixel"]
+        self.scale_metadata = dict(result["scale_data"])
         self.scale_needs_reset = False
         self.scale_reset_message = ""
         self.view_initialized = False
@@ -792,18 +842,27 @@ class SimpleCadApp:
             print(f"output_image={result['image_file']}")
             self.pending_address_search_log = False
 
-        self.show_temporary_notice(
-            f"地理院タイル{grid_size}x{grid_size}を取得しました\n"
-            f"1px = {self.meters_per_pixel:.4f}m"
-        )
+        if self.pending_center_pick_notice:
+            self.pending_center_pick_notice = False
+            self.show_temporary_notice("中心位置を更新しました", duration_ms=2400)
+        else:
+            self.show_temporary_notice(
+                f"地理院タイル{grid_size}x{grid_size}を取得しました\n"
+                f"1px = {self.meters_per_pixel:.4f}m"
+            )
         self.redraw(reset_view=True)
 
     def change_map_type(self, tile_type):
         """Switch map type and refetch the current GSI tiles."""
 
+        self.center_pick_mode = False
+        if self.interaction_mode == "center_picking":
+            self.interaction_mode = "idle"
+
         try:
             settings = dict(self.gsi_settings)
             settings["tile_type"] = tile_type
+            settings.pop("updated_at", None)
             self.gsi_settings = save_gsi_settings(settings)
         except (OSError, ValueError) as error:
             print(f"地図種別変更エラー: {error}")
@@ -1158,6 +1217,9 @@ class SimpleCadApp:
             print(f"{SCALE_FILE} を読み込めませんでした。初期縮尺を使います")
             return
 
+        if isinstance(data, dict):
+            self.scale_metadata = dict(data)
+
         loaded_scale = data.get("meters_per_pixel")
         scale_image_file = data.get("image_file")
 
@@ -1197,12 +1259,15 @@ class SimpleCadApp:
     def save_scale_settings(self):
         """現在の縮尺設定を scale.json に保存します。"""
 
-        data = {
+        data = dict(self.scale_metadata) if isinstance(self.scale_metadata, dict) else {}
+        data.update(
+            {
             "meters_per_pixel": self.meters_per_pixel,
             "image_file": self.get_storable_image_path(self.background_image_path),
             "image_filename": self.get_image_identity(self.background_image_path),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
+            }
+        )
 
         try:
             with open(SCALE_FILE, "w", encoding="utf-8") as file:
@@ -1211,6 +1276,7 @@ class SimpleCadApp:
             print(f"{SCALE_FILE} を保存できませんでした: {error}")
             return
 
+        self.scale_metadata = dict(data)
         print(f"縮尺設定を保存しました: {SCALE_FILE}")
 
     def build_project_data(self):
@@ -1276,6 +1342,7 @@ class SimpleCadApp:
         self.selected_point = None
         self.scale_mode = False
         self.scale_points = []
+        self.center_pick_mode = False
         self.interaction_mode = "drawing" if self.current_points else "idle"
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -1415,6 +1482,19 @@ class SimpleCadApp:
 
         return y - height - gap
 
+    def start_panel_section(self, y, title, title_gap=0.014, section_gap=0.018):
+        """Create a section title and return the first row y below it."""
+
+        title_text = self.create_panel_title(title, y)
+        self.section_titles.append(title_text)
+        row_y = self.next_panel_y(y, height=0.022, gap=title_gap)
+        return title_text, row_y, section_gap
+
+    def next_panel_section_y(self, current_y, section_gap=0.018):
+        """Return the next section start y below the previous content."""
+
+        return current_y - section_gap
+
     def create_panel_title(self, label, y):
         """右側パネルのセクション見出しを作ります。"""
 
@@ -1437,6 +1517,19 @@ class SimpleCadApp:
             button.on_clicked(callback)
 
         return button
+
+    def create_panel_info_text(self, x, y, fontsize=8.2):
+        """Create a text block for right-panel information."""
+
+        return self.fig.text(
+            x,
+            y,
+            "",
+            fontsize=fontsize,
+            color="#222222",
+            va="top",
+            linespacing=1.24,
+        )
 
     def create_panel_button_row(
         self,
@@ -1475,86 +1568,76 @@ class SimpleCadApp:
         """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
 
         panel_x = 0.68
-        button_width = 0.13
-        button_gap = 0.015
-        button_height = 0.04
+        button_width = 0.125
+        button_gap = 0.012
+        button_height = 0.038
+        row_gap = 0.010
+        full_width = (button_width * 2) + button_gap
 
         self.panel_status_text = self.fig.text(
             panel_x,
             0.982,
             "",
-            fontsize=8.8,
+            fontsize=8.5,
             color="#222222",
             va="top",
             linespacing=1.18,
         )
-        self.operation_title_text = self.create_panel_title("操作", 0.922)
-        self.section_titles.append(self.operation_title_text)
-        map_title = self.create_panel_title("地図切替", 0.715)
-        self.section_titles.append(map_title)
-        self.layer_title_text = self.create_panel_title("作図", 0.55)
-        self.section_titles.append(self.layer_title_text)
-        self.info_title_text = self.create_panel_title("情報", 0.235)
-        self.section_titles.append(self.info_title_text)
-        self.scale_reference_text = self.fig.text(
-            panel_x,
-            0.205,
-            "",
-            fontsize=8.4,
-            color="#222222",
-            va="top",
-            linespacing=1.22,
-        )
-        self.measurement_text = self.fig.text(
-            panel_x,
-            0.065,
-            "",
-            fontsize=8.4,
-            color="#222222",
-            va="top",
-            linespacing=1.22,
-        )
-
-        y = 0.865
-        self.address_search_button, self.gsi_tile_button = self.create_panel_button_row(
+        _, y, section_gap = self.start_panel_section(0.925, "操作")
+        self.operation_title_text = self.section_titles[-1]
+        self.address_search_button, self.center_pick_button = self.create_panel_button_row(
             "住所検索",
-            "地理院取得",
+            "中心指定",
             y,
             self.safe_callback("toggle_address_search", lambda event: self.toggle_address_search_ui()),
+            self.safe_callback("start_center_pick_mode", lambda event: self.start_center_pick_mode()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.gsi_tile_button, self.save_button = self.create_panel_button_row(
+            "地理院",
+            "DXF",
+            y,
             self.safe_callback("fetch_gsi_tile", lambda event: self.fetch_default_gsi_tile()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
-        self.save_button, self.project_save_button = self.create_panel_button_row(
-            "DXF保存",
-            "作業保存",
-            y,
             self.safe_callback("save_dxf", lambda event: self.save_dxf()),
-            self.safe_callback("save_project", lambda event: self.save_project()),
             x=panel_x,
             width=button_width,
             gap=button_gap,
             height=button_height,
         )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
-        self.project_load_button, self.address_search_from_settings_button = self.create_panel_button_row(
-            "作業読込",
-            "設定住所で検索",
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.project_save_button, self.project_load_button = self.create_panel_button_row(
+            "保存",
+            "読込",
             y,
+            self.safe_callback("save_project", lambda event: self.save_project()),
             self.safe_callback("load_project", lambda event: self.load_project()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.address_search_from_settings_button, self.gsi_settings_button = self.create_panel_button_row(
+            "設定住所",
+            "取得設定",
+            y,
             self.safe_callback(
                 "search_address_from_settings",
                 lambda event: self.search_address_from_settings(),
             ),
+            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
             x=panel_x,
             width=button_width,
             gap=button_gap,
             height=button_height,
         )
-        y = 0.638
+
+        section_start = self.next_panel_section_y(y, section_gap)
+        _, y, _ = self.start_panel_section(section_start, "地図")
         self.map_type_buttons["pale"], self.map_type_buttons["std"] = self.create_panel_button_row(
             "淡色",
             "標準",
@@ -1566,7 +1649,7 @@ class SimpleCadApp:
             gap=button_gap,
             height=button_height,
         )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
         self.map_type_buttons["seamlessphoto"] = self.create_panel_button(
             "写真",
             y,
@@ -1575,14 +1658,16 @@ class SimpleCadApp:
                 lambda event: self.change_map_type("seamlessphoto"),
             ),
             x=panel_x,
-            width=(button_width * 2) + button_gap,
+            width=full_width,
             height=button_height,
         )
 
-        y = 0.49
+        section_start = self.next_panel_section_y(y, section_gap)
+        _, y, _ = self.start_panel_section(section_start, "作図")
+        self.layer_title_text = self.section_titles[-1]
         self.layer_buttons["1"], self.layer_buttons["2"] = self.create_panel_button_row(
-            LAYERS["1"]["label"],
-            LAYERS["2"]["label"],
+            "道路",
+            "敷地",
             y,
             self.safe_callback("change_layer:1", lambda event: self.change_layer("1")),
             self.safe_callback("change_layer:2", lambda event: self.change_layer("2")),
@@ -1591,10 +1676,10 @@ class SimpleCadApp:
             gap=button_gap,
             height=button_height,
         )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
         self.layer_buttons["3"], self.layer_buttons["4"] = self.create_panel_button_row(
-            LAYERS["3"]["label"],
-            LAYERS["4"]["label"],
+            "法面",
+            "構造物",
             y,
             self.safe_callback("change_layer:3", lambda event: self.change_layer("3")),
             self.safe_callback("change_layer:4", lambda event: self.change_layer("4")),
@@ -1603,54 +1688,56 @@ class SimpleCadApp:
             gap=button_gap,
             height=button_height,
         )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
-        self.close_button, self.clear_button = self.create_panel_button_row(
-            "閉じて確定",
-            "作図クリア",
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.clear_button, self.scale_button = self.create_panel_button_row(
+            "クリア",
+            "縮尺",
+            y,
+            self.safe_callback("clear_drawings", lambda event: self.request_clear_drawings()),
+            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.close_button, self.undo_button = self.create_panel_button_row(
+            "閉じる",
+            "Undo",
             y,
             self.safe_callback(
                 "finish_current_line_closed",
                 lambda event: self.finish_current_line(closed=True),
             ),
-            self.safe_callback("clear_drawings", lambda event: self.request_clear_drawings()),
+            self.safe_callback("undo", lambda event: self.undo()),
             x=panel_x,
             width=button_width,
             gap=button_gap,
             height=button_height,
         )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
-        self.undo_button, self.redo_button = self.create_panel_button_row(
-            "Undo",
+        y = self.next_panel_y(y, height=button_height, gap=row_gap)
+        self.redo_button = self.create_panel_button(
             "Redo",
             y,
-            self.safe_callback("undo", lambda event: self.undo()),
             self.safe_callback("redo", lambda event: self.redo()),
             x=panel_x,
-            width=button_width,
-            gap=button_gap,
-            height=button_height,
-        )
-        y = self.next_panel_y(y, height=button_height, gap=0.012)
-        self.scale_button, self.gsi_settings_button = self.create_panel_button_row(
-            "縮尺設定",
-            "取得設定",
-            y,
-            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
-            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
-            x=panel_x,
-            width=button_width,
-            gap=button_gap,
+            width=full_width,
             height=button_height,
         )
 
+        section_start = self.next_panel_section_y(y, section_gap)
+        _, info_y, _ = self.start_panel_section(section_start, "情報")
+        self.info_title_text = self.section_titles[-1]
         self.info_detail_button = self.create_panel_button(
-            "詳細表示",
-            0.225,
+            "詳細",
+            info_y - 0.002,
             self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
-            x=0.86,
-            width=0.095,
-            height=0.032,
+            x=0.885,
+            width=0.07,
+            height=0.03,
         )
+        self.scale_reference_text = self.create_panel_info_text(panel_x, info_y - 0.045, fontsize=8.15)
+        self.measurement_text = self.create_panel_info_text(panel_x, info_y - 0.165, fontsize=8.15)
         self.update_layer_ui()
 
     def safe_callback(self, name, callback):
@@ -1688,6 +1775,22 @@ class SimpleCadApp:
             self.info_detail_button.label.set_text(
                 "詳細を隠す" if self.info_detail_expanded else "詳細表示"
             )
+
+        if self.center_pick_button is not None:
+            self.center_pick_button.ax.set_facecolor(
+                "#e5eefc" if self.center_pick_mode else "#f4f4f4"
+            )
+            self.center_pick_button.color = "#e5eefc" if self.center_pick_mode else "#f4f4f4"
+            self.center_pick_button.hovercolor = "#d4e4fb" if self.center_pick_mode else "#e8e8e8"
+            self.center_pick_button.label.set_fontweight(
+                "bold" if self.center_pick_mode else "normal"
+            )
+            self.center_pick_button.label.set_color(
+                "#1d4fa3" if self.center_pick_mode else "#222222"
+            )
+            for spine in self.center_pick_button.ax.spines.values():
+                spine.set_edgecolor("#1d4fa3" if self.center_pick_mode else "#bdbdbd")
+                spine.set_linewidth(1.8 if self.center_pick_mode else 0.8)
 
         if self.clear_button is not None:
             self.clear_button.label.set_text(
@@ -2529,6 +2632,83 @@ class SimpleCadApp:
         print("Redoしました")
         self.redraw()
 
+    def start_center_pick_mode(self):
+        """Enter the mode that lets the user recenter the GSI map by clicking."""
+
+        metadata = self.get_current_tile_grid_metadata()
+        if metadata is None:
+            self.show_temporary_notice(
+                "中心指定は地理院タイル表示中のみ使えます",
+                duration_ms=2800,
+            )
+            return
+
+        self.deactivate_toolbar_mode()
+        self.release_mouse_grab()
+        self.clear_scale_input_ui()
+        self.pan_active = False
+        self.space_down = False
+        self.scale_mode = False
+        self.scale_points = []
+        self.center_pick_mode = True
+        self.interaction_mode = "center_picking"
+        self.show_temporary_notice(
+            "中心にしたい位置をクリックしてください",
+            duration_ms=2200,
+        )
+        self.update_layer_ui()
+        self.redraw()
+
+    def cancel_center_pick_mode(self):
+        """Cancel center-pick mode without changing the map."""
+
+        if not self.center_pick_mode:
+            return False
+
+        self.center_pick_mode = False
+        self.interaction_mode = "idle"
+        self.show_temporary_notice("中心指定をキャンセルしました", duration_ms=1800)
+        self.update_layer_ui()
+        self.redraw()
+        return True
+
+    def apply_center_pick(self, image_point):
+        """Convert the clicked image point to lat/lon and refetch the GSI tiles."""
+
+        metadata = self.get_current_tile_grid_metadata()
+        if metadata is None:
+            self.center_pick_mode = False
+            self.interaction_mode = "idle"
+            self.show_temporary_notice(
+                "現在の背景では中心指定できません",
+                duration_ms=2800,
+            )
+            self.update_layer_ui()
+            return False
+
+        lat, lon = pixel_to_latlon_in_tile_grid(
+            image_point[0],
+            image_point[1],
+            metadata["zoom"],
+            metadata["center_tile_x"],
+            metadata["center_tile_y"],
+            metadata["grid_size"],
+        )
+
+        self.gsi_settings = save_gsi_settings(
+            {
+                **self.gsi_settings,
+                "latitude": lat,
+                "longitude": lon,
+                "updated_at": None,
+            }
+        )
+        self.center_pick_mode = False
+        self.interaction_mode = "idle"
+        self.pending_center_pick_notice = True
+        self.fetch_default_gsi_tile()
+        return True
+
     def request_clear_drawings(self):
         """Ask for confirmation, then clear only drawing geometry."""
 
@@ -2603,6 +2783,13 @@ class SimpleCadApp:
             return
 
         self.debug_click_event(event, reason="image-click")
+
+        if self.center_pick_mode:
+            if event.button != 1:
+                self.debug_click_event(event, reason="ignored:center_requires_left_click")
+                return
+            self.apply_center_pick(image_point)
+            return
 
         # 縮尺設定中は、他の作図操作より優先して左クリック2回を拾います。
         # ここを先に処理することで、点選択や通常作図に吸われる事故を防ぎます。
@@ -2788,12 +2975,17 @@ class SimpleCadApp:
             return
 
         if key == "escape":
+            if self.cancel_center_pick_mode():
+                return
             self.cancel_current_line()
             return
 
         if self.is_scaling_active():
             if self.scale_input_box is None:
                 print("縮尺設定中です。2点をクリックするか、Escでキャンセルしてください")
+            return
+
+        if self.center_pick_mode:
             return
 
         if key in ("ctrl+z", "cmd+z"):
@@ -2956,6 +3148,7 @@ class SimpleCadApp:
         self.deactivate_toolbar_mode()
         self.release_mouse_grab()
         self.current_layer_key = layer_key
+        self.center_pick_mode = False
         self.interaction_mode = "drawing"
         self.scale_mode = False
         self.scale_points = []
@@ -3087,6 +3280,7 @@ class SimpleCadApp:
         self.pan_start_xlim = None
         self.pan_start_ylim = None
         self.space_down = False
+        self.center_pick_mode = False
         self.scale_mode = True
         self.scale_points = []
         self.selected_point = None
