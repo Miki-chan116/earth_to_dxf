@@ -68,6 +68,7 @@ from src.geocoder import (
 from src.gsi_tile import (
     fetch_gsi_tile_grid,
     get_tile_type_label,
+    latlon_to_tile,
     load_gsi_settings,
     save_gsi_settings,
     validate_gsi_settings,
@@ -193,6 +194,10 @@ class SimpleCadApp:
         self.info_detail_expanded = False
         self.gsi_settings = load_gsi_settings()
         self.prefer_startup_line_map()
+        self.last_address_query = str(self.gsi_settings.get("address", "")).strip()
+        self.last_geocode_result = None
+        self.last_tile_fetch_result = None
+        self.pending_address_search_log = False
         self.gsi_settings_visible = False
         self.gsi_settings_texts = []
         self.gsi_settings_axes = []
@@ -252,7 +257,7 @@ class SimpleCadApp:
 
         self.fig, self.image_ax = plt.subplots(figsize=(12, 9))
         self.ax = self.image_ax
-        self.fig.subplots_adjust(right=0.76, bottom=0.12)
+        self.fig.subplots_adjust(right=0.64, bottom=0.12)
 
         self.status_text = self.fig.text(
             0.02,
@@ -267,6 +272,7 @@ class SimpleCadApp:
         self.info_title_text = None
         self.scale_reference_text = None
         self.measurement_text = None
+        self.section_titles = []
         self.panel_status_text = None
         self.layer_buttons = {}
         self.ui_axes_set = set()
@@ -338,6 +344,7 @@ class SimpleCadApp:
             return
 
         previous_image = self.image
+        self.last_tile_fetch_result = result
         self.background_image_path = self.normalize_image_path(result["image_file"])
         self.image = Image.open(self.background_image_path)
         self.meters_per_pixel = result["meters_per_pixel"]
@@ -441,22 +448,20 @@ class SimpleCadApp:
                 self.scale_points[1],
                 self.meters_per_pixel,
             )
-            return f"距離:\n{distance_m:.2f} m\n面積:\n-"
+            return f"距離:\n{distance_m:.2f} m"
 
         lines = []
         if len(self.current_points) >= 2:
-            lines.append("作図中延長:")
-            lines.append(f"{self.get_current_polyline_length_m():.2f} m")
+            lines.append(f"作図中延長: {self.get_current_polyline_length_m():.2f} m")
 
         selected_line = self.get_selected_line()
         if selected_line is not None:
-            lines.append("選択図形:")
-            lines.append(f"延長 {selected_line.get('length_m', 0.0):.2f} m")
+            lines.append(f"選択延長: {selected_line.get('length_m', 0.0):.2f} m")
             if selected_line.get("closed", False):
-                lines.append(f"面積 {selected_line.get('area_m2', 0.0):.2f} ㎡")
+                lines.append(f"選択面積: {selected_line.get('area_m2', 0.0):.2f} ㎡")
 
         if not lines:
-            return "距離:\n-\n面積:\n-"
+            return "距離/面積: -"
 
         return "\n".join(lines)
 
@@ -600,79 +605,77 @@ class SimpleCadApp:
         )
 
     def get_reference_scale_message(self, detailed=False):
-        """右側パネルへ表示する座標換算と参考印刷縮尺を作ります。"""
+        """右側パネルへ表示する要約情報と詳細情報を作ります。"""
 
-        background_filename = self.get_panel_filename(self.background_image_path)
-        paper_denominators = {}
+        background_filename = self.get_panel_filename(self.background_image_path, max_chars=26)
         lines = [
             f"背景: {background_filename}",
-            f"地図: {get_tile_type_label(self.gsi_settings['tile_type'])}",
-            f"換算: 1px={self.meters_per_pixel:.4f}m",
+            f"地図種別: {get_tile_type_label(self.gsi_settings['tile_type'])}",
         ]
-        address_label = self.gsi_settings.get("display_name") or self.gsi_settings.get("address")
-        if address_label:
-            lines.insert(0, f"検索地点: {address_label}")
+
+        input_address = (self.last_address_query or self.gsi_settings.get("address", "")).strip()
+        result_address = str(self.gsi_settings.get("display_name", "")).strip()
+        if input_address:
+            lines.append(f"入力住所: {input_address}")
+        if result_address:
+            lines.append(f"検索結果: {result_address}")
+
+        lines.append(f"緯度: {self.gsi_settings['latitude']:.6f}")
+        lines.append(f"経度: {self.gsi_settings['longitude']:.6f}")
+        lines.append(f"ズーム: {self.gsi_settings['zoom']}")
+        lines.append(f"縮尺: 1px={self.meters_per_pixel:.4f}m")
 
         if self.scale_needs_reset:
             lines.append("縮尺再設定が必要")
 
-        reference_lines = []
+        if not detailed:
+            return "\n".join(lines)
+
+        paper_denominators = {}
         for label, (paper_width_mm, paper_height_mm) in PRINT_PAPER_SIZES_MM.items():
-            denominator = self.get_print_scale_denominator(
+            paper_denominators[label] = self.get_print_scale_denominator(
                 paper_width_mm,
                 paper_height_mm,
             )
-            paper_denominators[label] = denominator
-            compact_label = label.replace("横", "")
 
-            if denominator is None:
-                scale_text = "計算不可"
-            else:
-                scale_text = f"1/{round(denominator):,}"
-
-            reference_lines.append(f"{compact_label} {scale_text}")
-
-        lines.append("参考: " + " / ".join(reference_lines))
-
-        a3_recommendation = self.format_standard_scale_recommendation(
-            "A3",
-            paper_denominators.get("A3横"),
-            compact=not detailed,
+        lines.append(
+            "A3参考: "
+            + self.format_standard_scale_recommendation(
+                "A3",
+                paper_denominators.get("A3横"),
+                compact=True,
+            )
         )
-        lines.append("推奨: " + a3_recommendation)
+        lines.append(
+            "A4参考: "
+            + self.format_standard_scale_recommendation(
+                "A4",
+                paper_denominators.get("A4横"),
+                compact=True,
+            )
+        )
+        lines.append("土木標準: 1/250 1/500 1/1000 1/2500 1/5000")
 
-        if detailed:
-            lines.append("標準: 1/250, 1/500, 1/1000, 1/2500, 1/5000")
+        if self.last_tile_fetch_result is not None:
             lines.append(
-                "A4: "
-                + self.format_standard_scale_recommendation(
-                    "A4",
-                    paper_denominators.get("A4横"),
-                    compact=True,
-                )
+                "タイル座標: "
+                f"x={self.last_tile_fetch_result.get('center_tile_x', '-')}"
+                f" y={self.last_tile_fetch_result.get('center_tile_y', '-')}"
             )
-
-            a3_width_mm, a3_height_mm = PRINT_PAPER_SIZES_MM["A3横"]
-            fits_a3_500 = self.image_fits_paper_at_scale(
-                a3_width_mm,
-                a3_height_mm,
-                A3_FOCUS_SCALE,
+            lines.append(
+                f"画像: {self.get_panel_filename(self.last_tile_fetch_result.get('image_file', ''), max_chars=26)}"
             )
+        else:
+            tile_x, tile_y = latlon_to_tile(
+                self.gsi_settings["latitude"],
+                self.gsi_settings["longitude"],
+                self.gsi_settings["zoom"],
+            )
+            lines.append(f"タイル座標: x={tile_x} y={tile_y}")
 
-            if fits_a3_500:
-                lines.append("A3 1/500: 収まる")
-            else:
-                next_scale = self.get_next_fitting_standard_scale(
-                    a3_width_mm,
-                    a3_height_mm,
-                )
-                if next_scale is None:
-                    lines.append("A3 1/500: 不可")
-                else:
-                    lines.append(f"A3 1/500: 不可 -> 1/{next_scale}")
-
-            lines.append("※印刷・図面作成の目安")
-
+        lines.append(
+            f"project: 線{len(self.lines)} / 作図中{len(self.current_points)} / layer {self.current_layer()['label']}"
+        )
         return "\n".join(lines)
 
     def get_panel_filename(self, image_path, max_chars=20):
@@ -748,6 +751,7 @@ class SimpleCadApp:
             tile_type=tile_type,
             grid_size=grid_size,
         )
+        self.last_tile_fetch_result = result
 
         previous_image = self.image
         self.background_image_path = self.normalize_image_path(result["image_file"])
@@ -771,6 +775,22 @@ class SimpleCadApp:
             f"grid={result['grid_size']}x{result['grid_size']}"
         )
         print(f"縮尺を自動設定しました: 1px = {self.meters_per_pixel:.4f}m")
+
+        if self.pending_address_search_log:
+            print("[address-search]")
+            print(f"address={self.last_address_query}")
+            print(
+                "result_address="
+                f"{self.gsi_settings.get('display_name') or self.gsi_settings.get('address', '')}"
+            )
+            print(f"lat={lat}")
+            print(f"lon={lon}")
+            print(f"zoom={zoom}")
+            print(f"tile_x={result['center_tile_x']}")
+            print(f"tile_y={result['center_tile_y']}")
+            print(f"tile_type={tile_type}")
+            print(f"output_image={result['image_file']}")
+            self.pending_address_search_log = False
 
         self.show_temporary_notice(
             f"地理院タイル{grid_size}x{grid_size}を取得しました\n"
@@ -888,16 +908,20 @@ class SimpleCadApp:
             self.set_address_search_error("住所を入力してください")
             return False
 
+        self.last_address_query = address
+        self.pending_address_search_log = True
         self.show_temporary_notice("住所検索中...", duration_ms=1800)
 
         try:
             geocode_result = geocode_address(address)
+            self.last_geocode_result = geocode_result
             self.gsi_settings = update_gsi_settings_from_address(
                 address,
                 geocode_result,
                 self.gsi_settings,
             )
         except (GeocodingError, OSError, ValueError) as error:
+            self.pending_address_search_log = False
             message = str(error)
             print(f"住所検索エラー: {message}")
             self.set_address_search_error(message)
@@ -1395,10 +1419,10 @@ class SimpleCadApp:
         """右側パネルのセクション見出しを作ります。"""
 
         return self.fig.text(
-            0.835,
+            0.68,
             y,
             label,
-            fontsize=11.5,
+            fontsize=11.0,
             fontweight="bold",
             color="#222222",
         )
@@ -1414,21 +1438,35 @@ class SimpleCadApp:
 
         return button
 
-    def create_panel_button_row(self, left_label, right_label, y, left_callback, right_callback):
+    def create_panel_button_row(
+        self,
+        left_label,
+        right_label,
+        y,
+        left_callback,
+        right_callback,
+        x=0.68,
+        width=0.13,
+        gap=0.015,
+        height=0.04,
+    ):
         """右側パネル用に横並び2ボタンを作ります。"""
 
         left_button = self.create_panel_button(
             left_label,
             y,
             left_callback,
-            width=0.066,
+            x=x,
+            width=width,
+            height=height,
         )
         right_button = self.create_panel_button(
             right_label,
             y,
             right_callback,
-            x=0.914,
-            width=0.066,
+            x=x + width + gap,
+            width=width,
+            height=height,
         )
 
         return left_button, right_button
@@ -1436,146 +1474,182 @@ class SimpleCadApp:
     def setup_widgets(self):
         """右側にレイヤ切り替えと主要操作ボタンを置きます。"""
 
+        panel_x = 0.68
+        button_width = 0.13
+        button_gap = 0.015
+        button_height = 0.04
+
         self.panel_status_text = self.fig.text(
-            0.835,
-            0.985,
+            panel_x,
+            0.982,
             "",
-            fontsize=8.5,
+            fontsize=8.8,
             color="#222222",
             va="top",
             linespacing=1.18,
         )
-        self.operation_title_text = self.create_panel_title("地図と操作", 0.925)
-        self.layer_title_text = self.create_panel_title("", 0.49)
-        self.info_title_text = self.create_panel_title("情報", 0.275)
+        self.operation_title_text = self.create_panel_title("操作", 0.922)
+        self.section_titles.append(self.operation_title_text)
+        map_title = self.create_panel_title("地図切替", 0.715)
+        self.section_titles.append(map_title)
+        self.layer_title_text = self.create_panel_title("作図", 0.55)
+        self.section_titles.append(self.layer_title_text)
+        self.info_title_text = self.create_panel_title("情報", 0.235)
+        self.section_titles.append(self.info_title_text)
         self.scale_reference_text = self.fig.text(
-            0.835,
-            0.195,
+            panel_x,
+            0.205,
             "",
-            fontsize=8.0,
+            fontsize=8.4,
             color="#222222",
             va="top",
-            linespacing=1.15,
+            linespacing=1.22,
         )
         self.measurement_text = self.fig.text(
-            0.835,
-            0.105,
+            panel_x,
+            0.065,
             "",
-            fontsize=8.2,
+            fontsize=8.4,
             color="#222222",
             va="top",
-            linespacing=1.18,
+            linespacing=1.22,
         )
 
         y = 0.865
-        for tile_type, label in (
-            ("std", "標準地図"),
-            ("pale", "淡色地図"),
-            ("seamlessphoto", "空中写真"),
-        ):
-            button = self.create_panel_button(
-                label,
-                y,
-                self.safe_callback(
-                    f"change_map_type:{tile_type}",
-                    lambda event, selected_tile_type=tile_type: self.change_map_type(
-                        selected_tile_type
-                    ),
-                ),
-            )
-            self.map_type_buttons[tile_type] = button
-            y = self.next_panel_y(y)
-
-        self.save_button = self.create_panel_button(
-            "DXF保存",
-            y,
-            self.safe_callback("save_dxf", lambda event: self.save_dxf()),
-        )
-        y = self.next_panel_y(y)
-        self.project_save_button = self.create_panel_button(
-            "作業保存",
-            y,
-            self.safe_callback("save_project", lambda event: self.save_project()),
-        )
-        y = self.next_panel_y(y)
-        self.project_load_button = self.create_panel_button(
-            "作業読込",
-            y,
-            self.safe_callback("load_project", lambda event: self.load_project()),
-        )
-        y = self.next_panel_y(y)
-        self.scale_button = self.create_panel_button(
-            "縮尺設定",
-            y,
-            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
-        )
-        y = self.next_panel_y(y)
-        self.gsi_settings_button = self.create_panel_button(
-            "取得設定",
-            y,
-            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
-        )
-        y = self.next_panel_y(y)
-        self.address_search_button = self.create_panel_button(
+        self.address_search_button, self.gsi_tile_button = self.create_panel_button_row(
             "住所検索",
+            "地理院取得",
             y,
             self.safe_callback("toggle_address_search", lambda event: self.toggle_address_search_ui()),
+            self.safe_callback("fetch_gsi_tile", lambda event: self.fetch_default_gsi_tile()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
         )
-        y = self.next_panel_y(y)
-        self.address_search_from_settings_button = self.create_panel_button(
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.save_button, self.project_save_button = self.create_panel_button_row(
+            "DXF保存",
+            "作業保存",
+            y,
+            self.safe_callback("save_dxf", lambda event: self.save_dxf()),
+            self.safe_callback("save_project", lambda event: self.save_project()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.project_load_button, self.address_search_from_settings_button = self.create_panel_button_row(
+            "作業読込",
             "設定住所で検索",
             y,
+            self.safe_callback("load_project", lambda event: self.load_project()),
             self.safe_callback(
                 "search_address_from_settings",
                 lambda event: self.search_address_from_settings(),
             ),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
         )
-        y = self.next_panel_y(y)
-        self.gsi_tile_button = self.create_panel_button(
-            "地理院取得",
+        y = 0.638
+        self.map_type_buttons["pale"], self.map_type_buttons["std"] = self.create_panel_button_row(
+            "淡色",
+            "標準",
             y,
-            self.safe_callback("fetch_gsi_tile", lambda event: self.fetch_default_gsi_tile()),
+            self.safe_callback("change_map_type:pale", lambda event: self.change_map_type("pale")),
+            self.safe_callback("change_map_type:std", lambda event: self.change_map_type("std")),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
         )
-        y = self.next_panel_y(y)
-        self.close_button = self.create_panel_button(
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.map_type_buttons["seamlessphoto"] = self.create_panel_button(
+            "写真",
+            y,
+            self.safe_callback(
+                "change_map_type:seamlessphoto",
+                lambda event: self.change_map_type("seamlessphoto"),
+            ),
+            x=panel_x,
+            width=(button_width * 2) + button_gap,
+            height=button_height,
+        )
+
+        y = 0.49
+        self.layer_buttons["1"], self.layer_buttons["2"] = self.create_panel_button_row(
+            LAYERS["1"]["label"],
+            LAYERS["2"]["label"],
+            y,
+            self.safe_callback("change_layer:1", lambda event: self.change_layer("1")),
+            self.safe_callback("change_layer:2", lambda event: self.change_layer("2")),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.layer_buttons["3"], self.layer_buttons["4"] = self.create_panel_button_row(
+            LAYERS["3"]["label"],
+            LAYERS["4"]["label"],
+            y,
+            self.safe_callback("change_layer:3", lambda event: self.change_layer("3")),
+            self.safe_callback("change_layer:4", lambda event: self.change_layer("4")),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.close_button, self.clear_button = self.create_panel_button_row(
             "閉じて確定",
+            "作図クリア",
             y,
             self.safe_callback(
                 "finish_current_line_closed",
                 lambda event: self.finish_current_line(closed=True),
             ),
-        )
-        y = self.next_panel_y(y)
-        self.clear_button = self.create_panel_button(
-            "作図クリア",
-            y,
             self.safe_callback("clear_drawings", lambda event: self.request_clear_drawings()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
         )
-        y = self.next_panel_y(y)
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
         self.undo_button, self.redo_button = self.create_panel_button_row(
             "Undo",
             "Redo",
             y,
             self.safe_callback("undo", lambda event: self.undo()),
             self.safe_callback("redo", lambda event: self.redo()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
         )
-
-        for index, (key, layer) in enumerate(LAYERS.items()):
-            layer_y = 0.434 - index * 0.046
-            button = self.create_panel_button(
-                layer["label"],
-                layer_y,
-                self.safe_callback(
-                    f"change_layer:{layer['label']}",
-                    lambda event, layer_key=key: self.change_layer(layer_key),
-                ),
-            )
-            self.layer_buttons[key] = button
+        y = self.next_panel_y(y, height=button_height, gap=0.012)
+        self.scale_button, self.gsi_settings_button = self.create_panel_button_row(
+            "縮尺設定",
+            "取得設定",
+            y,
+            self.safe_callback("start_scale_mode", lambda event: self.start_scale_mode()),
+            self.safe_callback("toggle_gsi_settings", lambda event: self.toggle_gsi_settings_ui()),
+            x=panel_x,
+            width=button_width,
+            gap=button_gap,
+            height=button_height,
+        )
 
         self.info_detail_button = self.create_panel_button(
             "詳細表示",
-            0.22,
+            0.225,
             self.safe_callback("toggle_info_detail", lambda event: self.toggle_info_detail()),
+            x=0.86,
+            width=0.095,
+            height=0.032,
         )
         self.update_layer_ui()
 
