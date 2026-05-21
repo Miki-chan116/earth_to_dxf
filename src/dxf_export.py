@@ -7,6 +7,9 @@ import ezdxf
 
 from src.constants import BACKGROUND_LAYER, LAYERS, OUTPUT_PREFIX
 
+SCALE_BAR_LAYER = {"name": "SCALE_BAR", "color": 7}
+SCALE_NOTE_LAYER = {"name": "SCALE_NOTE", "color": 8}
+
 
 def build_output_filename(output_prefix=OUTPUT_PREFIX):
     """Build the timestamped DXF output filename."""
@@ -35,6 +38,10 @@ def create_layers(doc, layers=LAYERS, background_layer=BACKGROUND_LAYER):
             name=background_layer["name"],
             color=background_layer["color"],
         )
+
+    for layer in (SCALE_BAR_LAYER, SCALE_NOTE_LAYER):
+        if layer["name"] not in doc.layers:
+            doc.layers.add(name=layer["name"], color=layer["color"])
 
 
 def add_background_image(
@@ -95,6 +102,97 @@ def add_lines(
         )
 
 
+def choose_scale_bar_length_m(image_width_m):
+    """Choose a readable scale bar length for the exported drawing."""
+
+    candidates = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+    target = max(float(image_width_m) * 0.15, 1.0)
+    usable = [candidate for candidate in candidates if candidate <= target]
+    return usable[-1] if usable else candidates[0]
+
+
+def add_text(msp, text, insert, height, layer_name):
+    """Add single-line text with a conservative ezdxf attribute set."""
+
+    msp.add_text(
+        text,
+        dxfattribs={
+            "insert": insert,
+            "height": height,
+            "layer": layer_name,
+        },
+    )
+
+
+def add_scale_annotations(
+    msp,
+    image_width,
+    image_height,
+    meters_per_pixel,
+    scale_bar_length_m=None,
+    approximate_scale_denominator=None,
+):
+    """Add a simple scale bar and approximate-scale notes to modelspace."""
+
+    image_width_m = float(image_width) * float(meters_per_pixel)
+    image_height_m = float(image_height) * float(meters_per_pixel)
+    if image_width_m <= 0 or image_height_m <= 0:
+        return
+
+    bar_length = float(scale_bar_length_m or choose_scale_bar_length_m(image_width_m))
+    margin_x = max(image_width_m * 0.035, 2.0)
+    margin_y = max(image_height_m * 0.035, 2.0)
+    tick_height = max(min(bar_length * 0.16, 3.0), 0.8)
+    text_height = max(min(image_width_m * 0.012, 3.0), 0.8)
+
+    x0 = margin_x
+    y0 = margin_y
+    x1 = x0 + bar_length
+
+    msp.add_line(
+        (x0, y0),
+        (x1, y0),
+        dxfattribs={"layer": SCALE_BAR_LAYER["name"]},
+    )
+    msp.add_line(
+        (x0, y0 - (tick_height / 2)),
+        (x0, y0 + (tick_height / 2)),
+        dxfattribs={"layer": SCALE_BAR_LAYER["name"]},
+    )
+    msp.add_line(
+        (x1, y0 - (tick_height / 2)),
+        (x1, y0 + (tick_height / 2)),
+        dxfattribs={"layer": SCALE_BAR_LAYER["name"]},
+    )
+
+    add_text(
+        msp,
+        f"{bar_length:g}m",
+        (x0, y0 + tick_height),
+        text_height,
+        SCALE_NOTE_LAYER["name"],
+    )
+
+    note_y = y0 + tick_height + (text_height * 1.8)
+    if approximate_scale_denominator:
+        add_text(
+            msp,
+            f"概算縮尺 1/{int(approximate_scale_denominator)}",
+            (x0, note_y),
+            text_height,
+            SCALE_NOTE_LAYER["name"],
+        )
+        note_y += text_height * 1.6
+
+    add_text(
+        msp,
+        "参考図・正式測量成果ではありません",
+        (x0, note_y),
+        text_height,
+        SCALE_NOTE_LAYER["name"],
+    )
+
+
 def export_dxf(
     lines,
     background_image_path,
@@ -103,6 +201,9 @@ def export_dxf(
     meters_per_pixel,
     output_dir=".",
     background_image_reference_path=None,
+    include_scale_annotations=False,
+    scale_bar_length_m=None,
+    approximate_scale_denominator=None,
 ):
     """Export the current drawing to a DXF file and return the filename."""
 
@@ -121,6 +222,15 @@ def export_dxf(
         meters_per_pixel,
     )
     add_lines(msp, lines, image_height, meters_per_pixel)
+    if include_scale_annotations:
+        add_scale_annotations(
+            msp,
+            image_width,
+            image_height,
+            meters_per_pixel,
+            scale_bar_length_m=scale_bar_length_m,
+            approximate_scale_denominator=approximate_scale_denominator,
+        )
 
     os.makedirs(output_dir, exist_ok=True)
     filename = os.path.join(output_dir, build_output_filename())

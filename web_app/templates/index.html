@@ -15,7 +15,6 @@
             <input id="addressInput" type="text" placeholder="住所を入力" value="{{ initial_state.address }}">
             <button id="searchButton" class="tool-button primary">住所検索</button>
           </div>
-          <button id="centerSelectButton" class="tool-button">中心指定</button>
           <button id="fetchButton" class="tool-button">再取得</button>
           <button class="tool-button map-type-button" data-tile-type="seamlessphoto">写真</button>
           <button class="tool-button map-type-button" data-tile-type="pale">淡色</button>
@@ -23,39 +22,126 @@
         </div>
         <div class="toolbar-group">
           <span class="toolbar-label">作図</span>
+          <button class="tool-button layer-button" data-layer="ROAD">道路</button>
+          <button class="tool-button layer-button" data-layer="SITE">敷地</button>
+          <button class="tool-button layer-button" data-layer="SLOPE">法面</button>
+          <button class="tool-button layer-button" data-layer="STRUCTURE">構造物</button>
+          <button id="finishLineButton" class="tool-button">線確定</button>
+          <button id="finishPolygonButton" class="tool-button">閉面確定</button>
+          <button id="undoButton" class="tool-button">戻る</button>
+          <button id="saveDxfButton" class="tool-button">DXF保存</button>
           <button id="clearPointsButton" class="tool-button">クリア</button>
+        </div>
+        <div class="toolbar-group">
+          <span class="toolbar-label">保存</span>
+          <button id="saveProjectButton" class="tool-button">作業保存</button>
+          <button id="loadProjectButton" class="tool-button">作業読込</button>
         </div>
       </header>
 
-      <main class="workspace">
-        <section class="map-panel">
-          <div class="map-stage" id="mapStage">
-            <img id="mapImage" src="{{ initial_state.image_url }}" alt="背景地図">
-            <svg id="drawOverlay" class="draw-overlay"></svg>
+      <main class="workspace-shell">
+        <div class="workspace">
+          <section class="map-panel">
+            <div class="map-stage" id="mapStage">
+              <div class="map-canvas">
+                <img id="mapImage" src="{{ initial_state.image_url }}" alt="背景地図">
+                <svg id="drawOverlay" class="draw-overlay"></svg>
+              </div>
+              <div class="map-control-panel" aria-label="地図操作">
+                <div class="mode-card compact">
+                  <span class="mode-label">MODE</span>
+                  <strong id="mapModeBadge">作図モード</strong>
+                </div>
+                <div class="map-control-stack">
+                  <div class="zoom-pad compact-row">
+                    <button class="map-control-button map-action-button" data-map-action="zoom_in">+</button>
+                    <button class="map-control-button map-action-button" data-map-action="zoom_out">-</button>
+                  </div>
+                  <div class="pan-pad">
+                    <span></span>
+                    <button class="map-control-button map-action-button" data-map-action="pan_up">↑</button>
+                    <span></span>
+                    <button class="map-control-button map-action-button" data-map-action="pan_left">←</button>
+                    <button id="centerSelectButton" class="map-control-button center-select-button">中心</button>
+                    <button class="map-control-button map-action-button" data-map-action="pan_right">→</button>
+                    <span></span>
+                    <button class="map-control-button map-action-button" data-map-action="pan_down">↓</button>
+                    <span></span>
+                  </div>
+                </div>
+              </div>
+              <div id="scaleBar" class="scale-bar" aria-label="スケールバー">
+                <div id="scaleBarLine" class="scale-bar-line"></div>
+                <div id="scaleBarLabel" class="scale-bar-label">-</div>
+              </div>
+            </div>
+          </section>
+
+          <aside class="info-panel">
+            <div class="panel-block">
+              <h2>情報</h2>
+              <dl class="info-list compact">
+                <div><dt>現在住所</dt><dd id="infoAddress">-</dd></div>
+                <div><dt>緯度 / 経度</dt><dd><span id="infoLatitude">-</span> / <span id="infoLongitude">-</span></dd></div>
+                <div><dt>地図 / Zoom</dt><dd><span id="infoTileType">-</span> / <span id="infoZoom">-</span></dd></div>
+                <div><dt>現在レイヤ</dt><dd id="infoCurrentLayer">道路</dd></div>
+                <div><dt>概算縮尺</dt><dd id="infoApproxScale">-</dd></div>
+                <div><dt>保存先</dt><dd id="infoOutputDir">-</dd></div>
+                <div><dt>作図中点数</dt><dd id="infoCurrentPointCount">0</dd></div>
+                <div><dt>作図中延長</dt><dd id="infoCurrentLength">0.00 m</dd></div>
+                <div><dt>確定図形数</dt><dd id="infoEntityCount">0</dd></div>
+                <div><dt>確定線総延長</dt><dd id="infoTotalLength">0.00 m</dd></div>
+                <div><dt>総面積</dt><dd id="infoTotalArea">0.00 ㎡</dd></div>
+              </dl>
+            </div>
+
+            <div class="panel-block">
+              <h2>作図中</h2>
+              <p class="draw-help">地図上クリックで点追加</p>
+            </div>
+          </aside>
+        </div>
+
+        <section class="layer-summary-bar">
+          <div id="layerSummaryList" class="layer-summary-list horizontal">
+            <div class="layer-summary-item">
+              <div class="layer-summary-head">
+                <span>道路</span>
+              </div>
+              <div class="layer-summary-values">
+                <span>延長: 0.00 m</span>
+                <span>面積: 0.00 ㎡</span>
+              </div>
+            </div>
+            <div class="layer-summary-item">
+              <div class="layer-summary-head">
+                <span>敷地</span>
+              </div>
+              <div class="layer-summary-values">
+                <span>延長: 0.00 m</span>
+                <span>面積: 0.00 ㎡</span>
+              </div>
+            </div>
+            <div class="layer-summary-item">
+              <div class="layer-summary-head">
+                <span>法面</span>
+              </div>
+              <div class="layer-summary-values">
+                <span>延長: 0.00 m</span>
+                <span>面積: 0.00 ㎡</span>
+              </div>
+            </div>
+            <div class="layer-summary-item">
+              <div class="layer-summary-head">
+                <span>構造物</span>
+              </div>
+              <div class="layer-summary-values">
+                <span>延長: 0.00 m</span>
+                <span>面積: 0.00 ㎡</span>
+              </div>
+            </div>
           </div>
         </section>
-
-        <aside class="info-panel">
-          <div class="panel-block">
-            <h2>情報</h2>
-            <dl class="info-list">
-              <div><dt>MODE</dt><dd id="infoMode">DRAW</dd></div>
-              <div><dt>現在住所</dt><dd id="infoAddress">-</dd></div>
-              <div><dt>検索結果</dt><dd id="infoDisplayName">-</dd></div>
-              <div><dt>緯度</dt><dd id="infoLatitude">-</dd></div>
-              <div><dt>経度</dt><dd id="infoLongitude">-</dd></div>
-              <div><dt>地図種別</dt><dd id="infoTileType">-</dd></div>
-              <div><dt>ズーム</dt><dd id="infoZoom">-</dd></div>
-              <div><dt>保存先</dt><dd id="infoOutputDir">-</dd></div>
-              <div><dt>点数</dt><dd id="infoPointCount">0</dd></div>
-            </dl>
-          </div>
-
-          <div class="panel-block">
-            <h2>作図中</h2>
-            <p class="draw-help">地図上をクリックすると点を追加します。点は線でつながります。</p>
-          </div>
-        </aside>
       </main>
 
       <footer class="statusbar">
