@@ -431,6 +431,40 @@ def adjust_map_view(action):
     return fetch_current_map(), "地図を移動しました"
 
 
+def pan_map_by_pixels(delta_x, delta_y, image_width=None, image_height=None):
+    """Pan the current map center by a drag delta in image pixels."""
+
+    metadata = get_current_tile_grid_metadata()
+    if metadata is None:
+        raise ValueError("現在の地図から移動量を計算できません")
+
+    image_size = float(metadata["grid_size"]) * TILE_SIZE
+    center_pixel_x = image_size / 2.0
+    center_pixel_y = image_size / 2.0
+
+    # Dragging the visible map to the right/down should bring the left/up area
+    # toward the center, so we sample the opposite pixel offset.
+    target_pixel_x = center_pixel_x - float(delta_x)
+    target_pixel_y = center_pixel_y - float(delta_y)
+
+    latitude, longitude = pixel_to_latlon_in_tile_grid(
+        pixel_x=target_pixel_x,
+        pixel_y=target_pixel_y,
+        zoom=metadata["zoom"],
+        center_tile_x=metadata["center_tile_x"],
+        center_tile_y=metadata["center_tile_y"],
+        grid_size=metadata["grid_size"],
+        tile_size=TILE_SIZE,
+    )
+
+    settings = load_gsi_settings()
+    settings["latitude"] = latitude
+    settings["longitude"] = longitude
+    update_settings_timestamp(settings)
+    save_gsi_settings(settings)
+    return fetch_current_map(), "地図を移動しました"
+
+
 @app.get("/")
 def index():
     """Render the prototype UI."""
@@ -532,6 +566,38 @@ def api_adjust_view():
             _, message = adjust_map_view(action)
     except Exception as error:
         return jsonify({"ok": False, "error": f"地図操作に失敗しました: {error}"}), 500
+
+    return jsonify(
+        {
+            "ok": True,
+            "message": message,
+            "state": build_state_payload(),
+        }
+    )
+
+
+@app.post("/api/pan-by-pixels")
+def api_pan_by_pixels():
+    """Pan the current map based on drag movement in image pixels."""
+
+    payload = request.get_json(silent=True) or {}
+
+    try:
+        delta_x = float(payload.get("delta_x"))
+        delta_y = float(payload.get("delta_y"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "delta_x / delta_y が不正です"}), 400
+
+    try:
+        with STATE_LOCK:
+            _, message = pan_map_by_pixels(
+                delta_x=delta_x,
+                delta_y=delta_y,
+                image_width=payload.get("image_width"),
+                image_height=payload.get("image_height"),
+            )
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"地図移動に失敗しました: {error}"}), 500
 
     return jsonify(
         {

@@ -50,7 +50,11 @@
               <div class="map-control-panel" aria-label="地図操作">
                 <div class="mode-card compact">
                   <span class="mode-label">MODE</span>
-                  <strong id="mapModeBadge">作図モード</strong>
+                  <div class="mode-switches" role="group" aria-label="操作モード">
+                    <button id="modeDrawButton" class="mode-switch-button" data-mode="DRAW">作図</button>
+                    <button id="modePanButton" class="mode-switch-button" data-mode="PAN">移動</button>
+                    <button id="modeCenterButton" class="mode-switch-button" data-mode="CENTER_SELECT">中心</button>
+                  </div>
                 </div>
                 <div class="map-control-stack">
                   <div class="zoom-pad compact-row">
@@ -62,7 +66,7 @@
                     <button class="map-control-button map-action-button" data-map-action="pan_up">↑</button>
                     <span></span>
                     <button class="map-control-button map-action-button" data-map-action="pan_left">←</button>
-                    <button id="centerSelectButton" class="map-control-button center-select-button">中心</button>
+                    <span class="pan-pad-center"></span>
                     <button class="map-control-button map-action-button" data-map-action="pan_right">→</button>
                     <span></span>
                     <button class="map-control-button map-action-button" data-map-action="pan_down">↓</button>

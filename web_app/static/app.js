@@ -4,6 +4,17 @@ const state = {
   entities: [],
   currentLayer: "ROAD",
   mode: "DRAW",
+  drag: {
+    active: false,
+    moved: false,
+    startClientX: 0,
+    startClientY: 0,
+    lastClientX: 0,
+    lastClientY: 0,
+    suppressClick: false,
+  },
+  mapUpdateInFlight: false,
+  lastWheelZoomAt: 0,
 };
 
 const layerStyles = {
@@ -16,7 +27,6 @@ const layerStyles = {
 const els = {
   addressInput: document.getElementById("addressInput"),
   searchButton: document.getElementById("searchButton"),
-  centerSelectButton: document.getElementById("centerSelectButton"),
   fetchButton: document.getElementById("fetchButton"),
   finishLineButton: document.getElementById("finishLineButton"),
   finishPolygonButton: document.getElementById("finishPolygonButton"),
@@ -27,6 +37,7 @@ const els = {
   clearPointsButton: document.getElementById("clearPointsButton"),
   mapImage: document.getElementById("mapImage"),
   mapStage: document.getElementById("mapStage"),
+  mapCanvas: document.querySelector(".map-canvas"),
   drawOverlay: document.getElementById("drawOverlay"),
   scaleBar: document.getElementById("scaleBar"),
   scaleBarLine: document.getElementById("scaleBarLine"),
@@ -50,6 +61,7 @@ const els = {
   infoTotalLength: document.getElementById("infoTotalLength"),
   infoTotalArea: document.getElementById("infoTotalArea"),
   layerSummaryList: document.getElementById("layerSummaryList"),
+  modeButtons: Array.from(document.querySelectorAll(".mode-switch-button")),
   mapTypeButtons: Array.from(document.querySelectorAll(".map-type-button")),
   mapActionButtons: Array.from(document.querySelectorAll(".map-action-button")),
   layerButtons: Array.from(document.querySelectorAll(".layer-button")),
@@ -58,6 +70,23 @@ const els = {
 function setStatus(message, isError = false) {
   els.statusMessage.textContent = message;
   els.statusMessage.style.color = isError ? "#b91c1c" : "#374151";
+}
+
+function updateDragCursor() {
+  const isDragging = state.drag.active && state.drag.moved && state.mode === "PAN";
+  els.mapStage.classList.toggle("is-dragging", isDragging);
+}
+
+function beginMapUpdate() {
+  if (state.mapUpdateInFlight) {
+    return false;
+  }
+  state.mapUpdateInFlight = true;
+  return true;
+}
+
+function endMapUpdate() {
+  state.mapUpdateInFlight = false;
 }
 
 function setTextIfPresent(element, value) {
@@ -71,7 +100,19 @@ function getLayerStyle(layerName) {
 }
 
 function getModeLabel() {
-  return state.mode === "CENTER_SELECT" ? "中心指定モード" : "作図モード";
+  if (state.mode === "PAN") {
+    return "移動モード";
+  }
+  if (state.mode === "CENTER_SELECT") {
+    return "中心指定モード";
+  }
+  return "作図モード";
+}
+
+function refreshModeButtons() {
+  els.modeButtons.forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.mode === state.mode);
+  });
 }
 
 function getEntityLength(entity) {
@@ -302,8 +343,11 @@ function refreshLayerButtons() {
 }
 
 function refreshModeUi() {
-  const centerSelecting = state.mode === "CENTER_SELECT";
-  els.centerSelectButton.classList.toggle("is-mode-active", centerSelecting);
+  els.mapStage.classList.toggle("is-draw-mode", state.mode === "DRAW");
+  els.mapStage.classList.toggle("is-pan-mode", state.mode === "PAN");
+  els.mapStage.classList.toggle("is-center-select", state.mode === "CENTER_SELECT");
+  refreshModeButtons();
+  updateDragCursor();
   refreshInfoPanel();
 }
 
@@ -330,7 +374,6 @@ function clearDrawingData() {
 
 function applyMapStateAfterRefetch(nextState, shouldClearDrawing = false) {
   state.app = nextState;
-  state.mode = "DRAW";
   if (shouldClearDrawing) {
     clearDrawingData();
   }
@@ -479,27 +522,70 @@ async function fetchMap() {
 }
 
 async function adjustMapView(action) {
+  if (!beginMapUpdate()) {
+    return;
+  }
+
   const shouldClearDrawing = hasDrawingData();
   if (!confirmMapChangeClearsDrawing()) {
+    endMapUpdate();
     setStatus("地図操作をキャンセルしました");
     return;
   }
 
   setStatus("地図を更新しています...");
-  const data = await postJson("/api/adjust-view", { action });
-  if (!data.ok) {
-    setStatus(data.error || "地図操作に失敗しました", true);
-    return;
+  try {
+    const data = await postJson("/api/adjust-view", { action });
+    if (!data.ok) {
+      setStatus(data.error || "地図操作に失敗しました", true);
+      return;
+    }
+
+    applyMapStateAfterRefetch(data.state, shouldClearDrawing);
+    setStatus(data.message || "地図を更新しました");
+  } finally {
+    endMapUpdate();
+  }
+}
+
+async function panMapByPixels(deltaX, deltaY) {
+  if (!beginMapUpdate()) {
+    return false;
   }
 
-  applyMapStateAfterRefetch(data.state, shouldClearDrawing);
-  setStatus(data.message || "地図を更新しました");
+  const shouldClearDrawing = hasDrawingData();
+  if (!confirmMapChangeClearsDrawing()) {
+    endMapUpdate();
+    setStatus("地図移動をキャンセルしました");
+    return false;
+  }
+
+  setStatus("地図をドラッグ移動しています...");
+  try {
+    const data = await postJson("/api/pan-by-pixels", {
+      delta_x: deltaX,
+      delta_y: deltaY,
+      image_width: els.mapImage.naturalWidth,
+      image_height: els.mapImage.naturalHeight,
+    });
+
+    if (!data.ok) {
+      setStatus(data.error || "地図移動に失敗しました", true);
+      alert(`地図移動に失敗しました: ${data.error || "unknown error"}`);
+      return false;
+    }
+
+    applyMapStateAfterRefetch(data.state, shouldClearDrawing);
+    setStatus(data.message || "地図を移動しました");
+    return true;
+  } finally {
+    endMapUpdate();
+  }
 }
 
 async function setCenterFromClick(pixelX, pixelY) {
   const shouldClearDrawing = hasDrawingData();
   if (!confirmMapChangeClearsDrawing()) {
-    state.mode = "DRAW";
     refreshModeUi();
     setStatus("中心指定をキャンセルしました");
     return false;
@@ -576,7 +662,6 @@ async function loadProject() {
   state.entities = Array.isArray(project.entities) ? project.entities : [];
   state.currentPoints = Array.isArray(project.currentPoints) ? project.currentPoints : [];
   state.currentLayer = layerStyles[project.currentLayer] ? project.currentLayer : "ROAD";
-  state.mode = "DRAW";
 
   if (project.webMapState && typeof project.webMapState === "object" && !data.warning) {
     state.app = { ...state.app, ...project.webMapState };
@@ -668,6 +753,11 @@ async function finishCurrentPolygon() {
 }
 
 function addPointFromClick(event) {
+  if (state.drag.suppressClick) {
+    state.drag.suppressClick = false;
+    return;
+  }
+
   const rect = els.mapImage.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -683,12 +773,98 @@ function addPointFromClick(event) {
     return;
   }
 
+  if (state.mode !== "DRAW") {
+    return;
+  }
+
   state.currentPoints.push({
     x: x * scaleX,
     y: y * scaleY,
   });
   drawPoints();
   setStatus(`点を追加しました: ${state.currentPoints.length}点`);
+}
+
+function handleMapMouseDown(event) {
+  if (event.button !== 0 || state.mode !== "PAN") {
+    return;
+  }
+
+  event.preventDefault();
+  state.drag.active = true;
+  state.drag.moved = false;
+  state.drag.startClientX = event.clientX;
+  state.drag.startClientY = event.clientY;
+  state.drag.lastClientX = event.clientX;
+  state.drag.lastClientY = event.clientY;
+  updateDragCursor();
+}
+
+function handleMapMouseMove(event) {
+  if (!state.drag.active || state.mode !== "PAN") {
+    return;
+  }
+
+  event.preventDefault();
+  state.drag.lastClientX = event.clientX;
+  state.drag.lastClientY = event.clientY;
+  const movedX = event.clientX - state.drag.startClientX;
+  const movedY = event.clientY - state.drag.startClientY;
+  if (Math.hypot(movedX, movedY) >= 5) {
+    state.drag.moved = true;
+    updateDragCursor();
+  }
+}
+
+async function handleMapMouseUp(event) {
+  if (!state.drag.active) {
+    return;
+  }
+
+  event.preventDefault();
+  const deltaX = event.clientX - state.drag.startClientX;
+  const deltaY = event.clientY - state.drag.startClientY;
+  const shouldPan = state.drag.moved && state.mode === "PAN";
+
+  state.drag.active = false;
+  state.drag.moved = false;
+  updateDragCursor();
+
+  if (!shouldPan) {
+    return;
+  }
+
+  state.drag.suppressClick = true;
+  await panMapByPixels(deltaX, deltaY);
+}
+
+function handleMapWheel(event) {
+  if (state.mode === "CENTER_SELECT") {
+    return;
+  }
+
+  if (!event.ctrlKey && !event.metaKey) {
+    return;
+  }
+
+  event.preventDefault();
+  const now = Date.now();
+  if (state.mapUpdateInFlight || now - state.lastWheelZoomAt < 140) {
+    return;
+  }
+  state.lastWheelZoomAt = now;
+
+  if (event.deltaY < 0) {
+    adjustMapView("zoom_in");
+    return;
+  }
+  if (event.deltaY > 0) {
+    adjustMapView("zoom_out");
+  }
+}
+
+function preventNativeImageDrag(event) {
+  event.preventDefault();
 }
 
 function clearPoints() {
@@ -734,9 +910,31 @@ function cancelCenterSelectMode() {
   if (state.mode !== "CENTER_SELECT") {
     return;
   }
-  state.mode = "DRAW";
+  setStatus("モードは維持されています。作図または移動を選ぶと切り替わります");
+}
+
+function changeMode(mode) {
+  if (!["DRAW", "PAN", "CENTER_SELECT"].includes(mode)) {
+    return;
+  }
+
+  state.mode = mode;
+  state.drag.active = false;
+  state.drag.moved = false;
+  updateDragCursor();
   refreshModeUi();
-  setStatus("中心指定をキャンセルしました");
+
+  if (mode === "CENTER_SELECT") {
+    setStatus("中心にしたい位置をクリックしてください");
+    return;
+  }
+
+  if (mode === "PAN") {
+    setStatus("移動モードです。ドラッグで地図を動かせます");
+    return;
+  }
+
+  setStatus("作図モードです。クリックで点を追加できます");
 }
 
 els.searchButton.addEventListener("click", searchAddress);
@@ -746,13 +944,6 @@ els.undoButton.addEventListener("click", undoDrawing);
 els.saveDxfButton.addEventListener("click", saveDxf);
 els.saveProjectButton.addEventListener("click", saveProject);
 els.loadProjectButton.addEventListener("click", loadProject);
-els.centerSelectButton.addEventListener("click", () => {
-  if (state.mode === "CENTER_SELECT") {
-    cancelCenterSelectMode();
-    return;
-  }
-  enterCenterSelectMode();
-});
 els.fetchButton.addEventListener("click", fetchMap);
 els.clearPointsButton.addEventListener("click", clearPoints);
 els.addressInput.addEventListener("keydown", (event) => {
@@ -769,13 +960,16 @@ els.mapActionButtons.forEach((button) => {
 els.layerButtons.forEach((button) => {
   button.addEventListener("click", () => selectLayer(button.dataset.layer));
 });
-els.mapImage.addEventListener("click", addPointFromClick);
-els.mapImage.addEventListener("load", drawPoints);
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    cancelCenterSelectMode();
-  }
+els.modeButtons.forEach((button) => {
+  button.addEventListener("click", () => changeMode(button.dataset.mode));
 });
+els.mapCanvas.addEventListener("mousedown", handleMapMouseDown);
+window.addEventListener("mousemove", handleMapMouseMove);
+window.addEventListener("mouseup", handleMapMouseUp);
+els.mapCanvas.addEventListener("click", addPointFromClick);
+els.mapImage.addEventListener("dragstart", preventNativeImageDrag);
+els.mapStage.addEventListener("wheel", handleMapWheel, { passive: false });
+els.mapImage.addEventListener("load", drawPoints);
 window.addEventListener("resize", drawPoints);
 
 refreshInfoPanel();

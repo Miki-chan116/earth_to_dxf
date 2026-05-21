@@ -162,6 +162,35 @@ body {
   color: #1d4ed8;
 }
 
+.mode-switches {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 3px;
+}
+
+.mode-switch-button {
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid #b7c3d2;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.96);
+  color: #334155;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.mode-switch-button:hover {
+  background: #eef3f9;
+}
+
+.mode-switch-button.is-active {
+  background: #e5eefc;
+  border-color: #1d4fa3;
+  color: #1d4fa3;
+}
+
 .map-control-stack {
   display: grid;
   gap: 4px;
@@ -230,6 +259,23 @@ body {
   background: transparent;
   overflow: visible;
   border-radius: 8px;
+  cursor: crosshair;
+}
+
+.map-stage.is-dragging {
+  cursor: grabbing;
+}
+
+.map-stage.is-pan-mode {
+  cursor: grab;
+}
+
+.map-stage.is-draw-mode {
+  cursor: crosshair;
+}
+
+.map-stage.is-center-select {
+  cursor: crosshair;
 }
 
 .map-canvas {
