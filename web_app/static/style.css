@@ -300,20 +300,19 @@ body {
 }
 
 .scale-bar {
-  position: sticky;
-  left: 16px;
-  bottom: 16px;
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
   z-index: 2;
   display: inline-flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   width: max-content;
-  margin: -64px 0 16px 16px;
-  padding: 8px 10px;
-  border: 1px solid rgba(31, 41, 55, 0.18);
+  padding: 6px 8px;
+  border: 1px solid rgba(31, 41, 55, 0.16);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.88);
-  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.1);
   pointer-events: none;
 }
 
@@ -344,7 +343,7 @@ body {
 
 .scale-bar-label {
   color: #111827;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   line-height: 1;
   text-align: center;

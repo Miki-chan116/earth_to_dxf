@@ -46,6 +46,10 @@
               <div class="map-canvas">
                 <img id="mapImage" src="{{ initial_state.image_url }}" alt="背景地図">
                 <svg id="drawOverlay" class="draw-overlay"></svg>
+                <div id="scaleBar" class="scale-bar" aria-label="スケールバー">
+                  <div id="scaleBarLine" class="scale-bar-line"></div>
+                  <div id="scaleBarLabel" class="scale-bar-label">-</div>
+                </div>
               </div>
               <div class="map-control-panel" aria-label="地図操作">
                 <div class="mode-card compact">
@@ -73,10 +77,6 @@
                     <span></span>
                   </div>
                 </div>
-              </div>
-              <div id="scaleBar" class="scale-bar" aria-label="スケールバー">
-                <div id="scaleBarLine" class="scale-bar-line"></div>
-                <div id="scaleBarLabel" class="scale-bar-label">-</div>
               </div>
             </div>
           </section>

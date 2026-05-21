@@ -59,6 +59,11 @@ MIN_GSI_ZOOM = 5
 MAX_GSI_ZOOM = 18
 PAN_RATIO = 0.2
 TILE_SIZE = 256
+GSI_TILE_MAX_ZOOMS = {
+    "std": 18,
+    "pale": 18,
+    "seamlessphoto": 18,
+}
 
 
 def get_output_assets_dir():
@@ -384,9 +389,14 @@ def adjust_map_view(action):
     """Update zoom or center coordinates and refetch the current map."""
 
     settings = load_gsi_settings()
+    tile_type = settings.get("tile_type", "pale")
+    max_zoom = GSI_TILE_MAX_ZOOMS.get(tile_type, MAX_GSI_ZOOM)
 
     if action == "zoom_in":
-        settings["zoom"] = min(int(settings["zoom"]) + 1, MAX_GSI_ZOOM)
+        current_zoom = int(settings["zoom"])
+        if current_zoom >= max_zoom:
+            return None, f"{get_tile_type_label(tile_type)} はズーム {max_zoom} が最大です"
+        settings["zoom"] = min(current_zoom + 1, max_zoom)
         update_settings_timestamp(settings)
         save_gsi_settings(settings)
         return fetch_current_map(), "拡大しました"
